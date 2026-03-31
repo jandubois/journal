@@ -13,9 +13,11 @@ import (
 )
 
 func main() {
-	// Check for subcommands before flag parsing.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
+		case "collect":
+			cmdCollect(os.Args[2:])
+			return
 		case "pending":
 			cmdPending(os.Args[2:])
 			return
@@ -28,11 +30,48 @@ func main() {
 		}
 	}
 
-	since := flag.String("since", "1d", "how far back to look (1d, 2d, 1w, or ISO date)")
-	format := flag.String("format", "text", "output format: text or markdown")
-	repos := flag.String("repos", defaultReposDir(), "directory containing git repos")
-	user := flag.String("user", "", "GitHub username (default: from gh api user)")
-	flag.Parse()
+	cmdReport(os.Args[1:])
+}
+
+// cmdCollect gathers observations from all sources into the database.
+func cmdCollect(args []string) {
+	fs := flag.NewFlagSet("collect", flag.ExitOnError)
+	repos := fs.String("repos", defaultReposDir(), "directory containing git repos")
+	user := fs.String("user", "", "GitHub username (default: from gh api user)")
+	fs.Parse(args)
+
+	var err error
+	if *user == "" {
+		*user, err = detectGitHubUser()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "could not detect GitHub user: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not load config: %v\n", err)
+		cfg = &Config{}
+	}
+
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: could not open database: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	collect(*user, *repos, cfg, db)
+}
+
+// cmdReport queries the database and renders a report.
+func cmdReport(args []string) {
+	fs := flag.NewFlagSet("journal", flag.ExitOnError)
+	since := fs.String("since", "1d", "how far back to look (1d, 2d, 1w, or ISO date)")
+	format := fs.String("format", "text", "output format: text or markdown")
+	user := fs.String("user", "", "GitHub username (default: from gh api user)")
+	fs.Parse(args)
 
 	cutoff, err := parseSince(*since)
 	if err != nil {
@@ -61,14 +100,12 @@ func main() {
 	}
 	defer db.Close()
 
-	collect(*user, *repos, cfg, db)
-
 	observations, err := queryObservations(db, cutoff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query observations: %v\n", err)
 		os.Exit(1)
 	}
-	activities := observationsToActivities(observations, cfg, *user)
+	activities := observationsToActivities(observations, cfg, *user, db)
 	topics := groupActivities(activities)
 
 	enrichTopicsWithHistory(db, topics, observations, cfg, *user)
@@ -78,7 +115,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: process events: %v\n", err)
 	}
 
-	// Apply AI summaries where available.
 	applyAISummaries(db, topics)
 
 	switch *format {
@@ -246,7 +282,7 @@ func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observa
 		return
 	}
 
-	histActivities := observationsToActivities(histObs, cfg, user)
+	histActivities := observationsToActivities(histObs, cfg, user, db)
 
 	existingIDs := make(map[int64]bool)
 	for _, t := range topics {

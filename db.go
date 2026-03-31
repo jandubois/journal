@@ -56,6 +56,24 @@ CREATE INDEX IF NOT EXISTS idx_observations_repo ON observations(repo);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_repo ON events(repo);
 
+-- Caches for fork parents and PR info, persisted across runs to avoid
+-- repeated API calls during report generation.
+CREATE TABLE IF NOT EXISTS repo_cache (
+    repo       TEXT PRIMARY KEY,
+    parent     TEXT NOT NULL DEFAULT '',
+    cached_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS pr_cache (
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    title      TEXT NOT NULL DEFAULT '',
+    state      TEXT NOT NULL DEFAULT '',
+    merged     INTEGER NOT NULL DEFAULT 0,
+    cached_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (repo, number)
+);
+
 -- AI-generated summaries, keyed by (repo, number) to survive event rebuilds.
 -- number=0 entries use the timestamp to distinguish repo-level events from
 -- different time periods.
@@ -260,9 +278,10 @@ func queryTopicHistory(db *sql.DB, repoNumbers [][2]string) ([]Observation, erro
 
 // observationsToActivities reconstructs Activity structs from database observations,
 // applying all interpretation: fork resolution, work classification, PR merge detection.
-func observationsToActivities(observations []Observation, cfg *Config, user string) []Activity {
-	forkCache := make(map[string]string)
-	prCache := make(map[string]*prInfo)
+// Uses DB-backed caches to avoid repeated API calls across runs.
+func observationsToActivities(observations []Observation, cfg *Config, user string, db *sql.DB) []Activity {
+	forkCache := loadRepoCache(db)
+	prCache := loadPRCache(db)
 
 	var activities []Activity
 	for _, o := range observations {
@@ -271,6 +290,11 @@ func observationsToActivities(observations []Observation, cfg *Config, user stri
 			activities = append(activities, *a)
 		}
 	}
+
+	// Persist any new cache entries.
+	saveRepoCache(db, forkCache)
+	savePRCache(db, prCache)
+
 	return activities
 }
 
@@ -470,6 +494,77 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// DB-backed caches for fork parents and PR info.
+
+func loadRepoCache(db *sql.DB) map[string]string {
+	cache := make(map[string]string)
+	if db == nil {
+		return cache
+	}
+	rows, err := db.Query("SELECT repo, parent FROM repo_cache")
+	if err != nil {
+		return cache
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var repo, parent string
+		if rows.Scan(&repo, &parent) == nil {
+			cache[repo] = parent
+		}
+	}
+	return cache
+}
+
+func saveRepoCache(db *sql.DB, cache map[string]string) {
+	if db == nil {
+		return
+	}
+	for repo, parent := range cache {
+		db.Exec("INSERT OR REPLACE INTO repo_cache (repo, parent) VALUES (?, ?)", repo, parent)
+	}
+}
+
+func loadPRCache(db *sql.DB) map[string]*prInfo {
+	cache := make(map[string]*prInfo)
+	if db == nil {
+		return cache
+	}
+	rows, err := db.Query("SELECT repo, number, title, state, merged FROM pr_cache")
+	if err != nil {
+		return cache
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var repo string
+		var number, merged int
+		var title, state string
+		if rows.Scan(&repo, &number, &title, &state, &merged) == nil {
+			key := fmt.Sprintf("%s#%d", repo, number)
+			cache[key] = &prInfo{Title: title, State: state, Merged: merged != 0}
+		}
+	}
+	return cache
+}
+
+func savePRCache(db *sql.DB, cache map[string]*prInfo) {
+	if db == nil {
+		return
+	}
+	for key, info := range cache {
+		if info == nil {
+			continue
+		}
+		parts := strings.SplitN(key, "#", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		var number int
+		fmt.Sscanf(parts[1], "%d", &number)
+		db.Exec("INSERT OR REPLACE INTO pr_cache (repo, number, title, state, merged) VALUES (?, ?, ?, ?, ?)",
+			parts[0], number, info.Title, info.State, boolToInt(info.Merged))
+	}
 }
 
 // AI summary storage and retrieval.

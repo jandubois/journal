@@ -8,8 +8,7 @@ Invoke with `/summarize` or `/summarize 2w` to enrich journal reports with AI-ge
 
 ## How it works
 
-1. First, populate the events table: run `./journal --since <range>` (suppressing output with `> /dev/null`). The events table is rebuilt on each run, so this step ensures it covers the requested range.
-2. Run `./journal pending --since <range> --limit 30` to get events needing summaries.
+1. Run `./journal pending --since <range> --limit 30` to get events needing summaries. If the result shows 0 events, the user may need to run `journal collect` first, or generate a report with `journal --since <range>` to populate the events table.
 3. For each event, run `./journal observations --event <id>` to get the raw observations.
 4. For session observations with an `archive_path`, read excerpts from the archived JSONL to understand what was done.
 5. Generate a concise, one-line summary that describes *what was accomplished*, not just *what happened*.
