@@ -58,6 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_events_repo ON events(repo);
 `
 
 type Observation struct {
+	ID       int64           `json:"id"`
 	Source   string          `json:"source"`
 	SourceID string          `json:"source_id"`
 	Time     time.Time       `json:"time"`
@@ -174,7 +175,7 @@ func insertObservations(db *sql.DB, observations []Observation) error {
 func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	sinceStr := since.UTC().Format(time.RFC3339Nano)
 	rows, err := db.Query(
-		`SELECT source, source_id, timestamp, repo, data
+		`SELECT id, source, source_id, timestamp, repo, data
 		 FROM observations
 		 WHERE timestamp >= ?
 		 ORDER BY timestamp`,
@@ -189,7 +190,7 @@ func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	for rows.Next() {
 		var o Observation
 		var ts, dataStr string
-		if err := rows.Scan(&o.Source, &o.SourceID, &ts, &o.Repo, &dataStr); err != nil {
+		if err := rows.Scan(&o.ID, &o.Source, &o.SourceID, &ts, &o.Repo, &dataStr); err != nil {
 			return nil, err
 		}
 		o.Time, _ = time.Parse(time.RFC3339Nano, ts)
@@ -225,9 +226,10 @@ func observationToActivity(o Observation, cfg *Config, user string, forkCache ma
 	repo, work := resolveRepo(o.Repo, o.Source, user, cfg, forkCache)
 
 	a := Activity{
-		Time: o.Time,
-		Repo: repo,
-		Work: work,
+		ObservationID: o.ID,
+		Time:          o.Time,
+		Repo:          repo,
+		Work:          work,
 	}
 
 	switch o.Source {

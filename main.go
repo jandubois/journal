@@ -47,16 +47,19 @@ func main() {
 	// Collect: fetch latest data from all sources into the database.
 	collect(*user, *repos, cfg, db)
 
-	// Report: query the database for the requested time range.
+	// Process: convert observations into grouped events.
 	observations, err := queryObservations(db, cutoff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query observations: %v\n", err)
 		os.Exit(1)
 	}
 	activities := observationsToActivities(observations, cfg, *user)
-
 	topics := groupActivities(activities)
 	inferNextSteps(topics)
+
+	if err := processEvents(db, topics); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: process events: %v\n", err)
+	}
 
 	switch *format {
 	case "text":

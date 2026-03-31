@@ -7,16 +7,17 @@ import (
 )
 
 type Activity struct {
-	Time     time.Time     `json:"time"`
-	Duration time.Duration `json:"duration,omitempty"`
-	Kind     string        `json:"kind"`
-	Repo     string        `json:"repo"`
-	Number   int           `json:"number,omitempty"`
-	Title    string        `json:"title,omitempty"`
-	URL      string        `json:"url,omitempty"`
-	Details  string        `json:"details,omitempty"`
-	IsAuthor bool          `json:"isAuthor,omitempty"`
-	Work     bool          `json:"work,omitempty"`
+	ObservationID int64         `json:"-"` // links back to source observation
+	Time          time.Time     `json:"time"`
+	Duration      time.Duration `json:"duration,omitempty"`
+	Kind          string        `json:"kind"`
+	Repo          string        `json:"repo"`
+	Number        int           `json:"number,omitempty"`
+	Title         string        `json:"title,omitempty"`
+	URL           string        `json:"url,omitempty"`
+	Details       string        `json:"details,omitempty"`
+	IsAuthor      bool          `json:"isAuthor,omitempty"`
+	Work          bool          `json:"work,omitempty"`
 }
 
 type Topic struct {
