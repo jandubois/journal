@@ -56,27 +56,85 @@ func scanProjectSessions(projDir, projName string) []Observation {
 
 	var observations []Observation
 	for _, entry := range entries {
+		name := entry.Name()
+
+		if !entry.IsDir() && strings.HasSuffix(name, ".jsonl") {
+			// Main session file.
+			sessionID := strings.TrimSuffix(name, ".jsonl")
+			srcPath := filepath.Join(projDir, name)
+			startTime, duration, prompts := parseSessionFile(srcPath)
+			if startTime.IsZero() {
+				continue
+			}
+
+			archivePath := archiveSessionFile(srcPath, projName, sessionID, archiveDir)
+
+			data, err := json.Marshal(map[string]any{
+				"session_id":       sessionID,
+				"project_dir":      filepath.Base(projDir),
+				"project_name":     projName,
+				"duration_seconds":  int(duration.Seconds()),
+				"prompts":          prompts,
+				"archive_path":     archivePath,
+			})
+			if err != nil {
+				continue
+			}
+
+			observations = append(observations, Observation{
+				Source:   "session",
+				SourceID: sessionID,
+				Time:     startTime,
+				Repo:     repo,
+				Data:     data,
+			})
+		}
+
+		if entry.IsDir() {
+			// Session subdirectory — may contain subagent JSONL files.
+			parentSessionID := name
+			observations = append(observations,
+				scanSubagentSessions(filepath.Join(projDir, name), parentSessionID, projName, repo, archiveDir)...)
+		}
+	}
+
+	return observations
+}
+
+func scanSubagentSessions(sessionDir, parentSessionID, projName, repo, archiveDir string) []Observation {
+	subagentsDir := filepath.Join(sessionDir, "subagents")
+	entries, err := os.ReadDir(subagentsDir)
+	if err != nil {
+		return nil
+	}
+
+	var observations []Observation
+	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 
-		sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
-		srcPath := filepath.Join(projDir, entry.Name())
+		agentID := strings.TrimSuffix(entry.Name(), ".jsonl")
+		srcPath := filepath.Join(subagentsDir, entry.Name())
 		startTime, duration, prompts := parseSessionFile(srcPath)
 		if startTime.IsZero() {
 			continue
 		}
 
-		// Archive the session file for future AI summarization.
-		archivePath := archiveSessionFile(srcPath, projName, sessionID, archiveDir)
+		// Archive under the same project, with parent session prefix.
+		archiveSubDir := filepath.Join(projName, parentSessionID)
+		archivePath := archiveSessionFile(srcPath, archiveSubDir, agentID, archiveDir)
+
+		sourceID := parentSessionID + "/" + agentID
 
 		data, err := json.Marshal(map[string]any{
-			"session_id":       sessionID,
-			"project_dir":      filepath.Base(projDir),
-			"project_name":     projName,
-			"duration_seconds":  int(duration.Seconds()),
-			"prompts":          prompts,
-			"archive_path":     archivePath,
+			"session_id":        sourceID,
+			"parent_session_id": parentSessionID,
+			"agent_id":          agentID,
+			"project_name":      projName,
+			"duration_seconds":   int(duration.Seconds()),
+			"prompts":           prompts,
+			"archive_path":      archivePath,
 		})
 		if err != nil {
 			continue
@@ -84,7 +142,7 @@ func scanProjectSessions(projDir, projName string) []Observation {
 
 		observations = append(observations, Observation{
 			Source:   "session",
-			SourceID: sessionID,
+			SourceID: sourceID,
 			Time:     startTime,
 			Repo:     repo,
 			Data:     data,
