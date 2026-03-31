@@ -1,3 +1,8 @@
+---
+name: summarize
+description: Generate AI summaries for journal events that lack them. Invoke with /summarize or /summarize 2w.
+---
+
 # Summarize journal events
 
 Generate AI summaries for journal events that lack them.
