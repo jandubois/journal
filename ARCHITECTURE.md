@@ -35,6 +35,10 @@ Interpretation happens here, not in collectors:
 
 Events link back to their source observations through the `event_observations` junction table, enabling drill-down from a high-level summary to individual commits, reviews, and sessions.
 
+For numbered topics (PRs, issues), the processing step loads full observation history regardless of the `--since` window. This ensures that a PR opened last week but reviewed today is correctly identified as authored by the user, yielding accurate next-step inference.
+
+Events are rebuilt from scratch on each run (atomic delete + rewrite within a single transaction). Event IDs are not stable across runs; external references should use `(repo, number)` as the identity.
+
 ### Layer 3: Report
 
 The report layer renders topics as text or markdown, split into work and personal sections. Done topics (merged PRs, closed issues) render as compact one-liners. Active topics show a chronological activity list with timestamps and an inferred next step.
