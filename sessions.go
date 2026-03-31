@@ -202,26 +202,63 @@ func isSystemPrompt(prompt string) bool {
 
 // projectDirToName converts a project directory name to a readable project name.
 // e.g. "-Users-jan-git-rancher-desktop-app" -> "rancher-desktop-app"
+//      "-Users-jan--claude" -> ".claude"
+//      "-Users-jan-Dropbox-git-omnifocus" -> "omnifocus"
+//      "-Users-jan-git-git-lint" -> "git-lint"
 func projectDirToName(dirName string) string {
-	// The directory name encodes the path with dashes replacing slashes.
-	// Try to extract the last meaningful segment after "git-".
-	if idx := strings.LastIndex(dirName, "-git-"); idx >= 0 {
-		return dirName[idx+5:]
+	// The directory name encodes the filesystem path: dashes replace slashes,
+	// and leading dots become leading dashes (e.g. .claude -> -claude).
+
+	// Strip the home directory prefix, then look for the first "-git-" segment.
+	home, _ := os.UserHomeDir()
+	homePrefix := strings.ReplaceAll(home, "/", "-")
+	rest := strings.TrimPrefix(dirName, homePrefix)
+	rest = strings.TrimPrefix(rest, "-")
+
+	// Look for "-git-" which indicates the git repos directory.
+	// Use the part after the first occurrence as the project name.
+	if idx := strings.Index(rest, "git-"); idx >= 0 {
+		name := rest[idx+4:]
+		if name != "" {
+			return name
+		}
 	}
-	// Fall back to stripping common prefixes.
-	dirName = strings.TrimPrefix(dirName, "-Users-")
-	if idx := strings.IndexByte(dirName, '-'); idx > 0 {
-		dirName = dirName[idx+1:]
+
+	// For paths like "git" (the ~/git directory itself), or dotfiles like ".claude".
+	if strings.HasPrefix(rest, "-") {
+		return "." + rest[1:]
 	}
-	return dirName
+
+	return rest
+}
+
+// findLocalRepo tries to find a local git repo matching the project name.
+// The Claude project directory encoding is lossy (both / and - become -),
+// so we try the exact name first, then scan for a match with underscores.
+func findLocalRepo(projName string) string {
+	home, _ := os.UserHomeDir()
+
+	// Try exact match first.
+	repoPath := filepath.Join(home, "git", projName)
+	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+		return repoPath
+	}
+
+	// Try replacing dashes with underscores (common mismatch).
+	altName := strings.ReplaceAll(projName, "-", "_")
+	if altName != projName {
+		repoPath = filepath.Join(home, "git", altName)
+		if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+			return repoPath
+		}
+	}
+
+	return ""
 }
 
 // projectNameToRepo maps a project name to a repo slug.
-// It checks ~/git/<projName> for a GitHub remote.
 func projectNameToRepo(projName string, cfg *Config) string {
-	home, _ := os.UserHomeDir()
-	repoPath := filepath.Join(home, "git", projName)
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+	if repoPath := findLocalRepo(projName); repoPath != "" {
 		return repoSlug(repoPath, cfg)
 	}
 	return projName
@@ -229,9 +266,7 @@ func projectNameToRepo(projName string, cfg *Config) string {
 
 // projectIsWork checks if a project is work-related.
 func projectIsWork(projName string, cfg *Config) bool {
-	home, _ := os.UserHomeDir()
-	repoPath := filepath.Join(home, "git", projName)
-	if _, err := os.Stat(filepath.Join(repoPath, ".git")); err == nil {
+	if repoPath := findLocalRepo(projName); repoPath != "" {
 		return isWorkDir(repoPath, cfg)
 	}
 	// If no local repo, check if the project name matches a work org.
