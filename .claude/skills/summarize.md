@@ -8,12 +8,13 @@ Invoke with `/summarize` or `/summarize 2w` to enrich journal reports with AI-ge
 
 ## How it works
 
-1. Run `./journal pending --since <range> --limit 10` to get events needing summaries (use the range from the argument, or `1w` if none)
-2. For each event, run `./journal observations --event <id>` to get the raw observations
-3. For session observations with an `archive_path`, read excerpts from the archived JSONL to understand what was done
-4. Generate a concise, one-line summary that describes *what was accomplished*, not just *what happened*
-5. Store each summary with `./journal set-summary --repo <repo> --number <number> [--period <date>] <summary>`
-6. Report how many events were summarized and how many remain
+1. First, populate the events table: run `./journal --since <range>` (suppressing output with `> /dev/null`). The events table is rebuilt on each run, so this step ensures it covers the requested range.
+2. Run `./journal pending --since <range> --limit 30` to get events needing summaries.
+3. For each event, run `./journal observations --event <id>` to get the raw observations.
+4. For session observations with an `archive_path`, read excerpts from the archived JSONL to understand what was done.
+5. Generate a concise, one-line summary that describes *what was accomplished*, not just *what happened*.
+6. Store each summary with `./journal set-summary --repo <repo> --number <number> [--period <date>] <summary>`.
+7. After processing, report progress: "Summaries for the last N days complete, M events pending."
 
 ## Summary style guide
 
@@ -43,7 +44,8 @@ Keep archive reads brief — scan the first few user messages, don't read the en
 
 ## Batch processing
 
-Process one day at a time, most recent first. After each batch:
-- Report how many summaries were generated
-- Report how many events still need summaries
+Process one day at a time, most recent first. After completing a batch:
+- Report how many summaries were generated in this batch
+- Report how many events still need summaries (from the `total_pending` field in the pending output)
+- Format as: "Summaries for the last N days complete, M events pending."
 - Ask the user if they want to continue with the next batch
