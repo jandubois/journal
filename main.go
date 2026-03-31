@@ -59,7 +59,7 @@ func main() {
 
 	// Load full history for numbered topics so next-step inference
 	// sees the complete picture (e.g. a PR opened last week but reviewed today).
-	enrichTopicsWithHistory(db, topics, cfg, *user)
+	enrichTopicsWithHistory(db, topics, observations, cfg, *user)
 	inferNextSteps(topics)
 
 	if err := processEvents(db, topics); err != nil {
@@ -83,27 +83,35 @@ func main() {
 // (PRs, issues) so that next-step inference sees events from before the --since
 // window. Without this, a PR opened last week but reviewed today would appear
 // as if the user is only a reviewer, yielding wrong next steps.
-func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, cfg *Config, user string) {
-	// Collect (raw repo slug, number) pairs for topics that have PR/issue numbers.
-	// We need the raw repo slug (before fork resolution) to match observations.
+func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observation, cfg *Config, user string) {
+	// Build a map from ObservationID → raw repo slug. Activities carry the
+	// resolved slug; we need the raw slug to query the observations table.
+	rawRepoByObsID := make(map[int64]string)
+	for _, o := range observations {
+		rawRepoByObsID[o.ID] = o.Repo
+	}
+
+	// Collect (raw repo slug, number) pairs for numbered topics.
 	var repoNumbers [][2]string
 	seen := make(map[string]bool)
 	for _, t := range topics {
 		if t.Number == 0 {
 			continue
 		}
-		// Query with the resolved repo — observations may use different raw slugs,
-		// but the number within each repo is what matters for grouping.
+		numStr := fmt.Sprintf("%d", t.Number)
+
+		// Find all raw repo slugs from this topic's observations.
 		for _, a := range t.Activities {
-			// Use the raw observation repo (before resolution) for the query.
-			// We need to look it up from the observation's source data.
-			key := fmt.Sprintf("%s#%d", t.Repo, t.Number)
+			rawRepo := rawRepoByObsID[a.ObservationID]
+			if rawRepo == "" {
+				rawRepo = t.Repo // fallback to resolved
+			}
+			key := fmt.Sprintf("%s#%s", rawRepo, numStr)
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-			repoNumbers = append(repoNumbers, [2]string{a.Repo, fmt.Sprintf("%d", t.Number)})
-			break
+			repoNumbers = append(repoNumbers, [2]string{rawRepo, numStr})
 		}
 	}
 
@@ -111,13 +119,7 @@ func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, cfg *Config, user stri
 		return
 	}
 
-	// Also query with raw (pre-fork-resolution) repo slugs from the observations.
-	var rawRepoNumbers [][2]string
-	for _, rn := range repoNumbers {
-		rawRepoNumbers = append(rawRepoNumbers, rn)
-	}
-	// Query observations that share the same numbers across related repos.
-	histObs, err := queryTopicHistory(db, rawRepoNumbers)
+	histObs, err := queryTopicHistory(db, repoNumbers)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: load topic history: %v\n", err)
 		return
