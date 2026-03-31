@@ -1,14 +1,16 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 )
 
 // fetchGitHubEvents retrieves the user's recent GitHub events and converts them to activities.
-func fetchGitHubEvents(user string, since time.Time, cfg *Config) ([]Activity, error) {
+func fetchGitHubEvents(user string, since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
 	var allEvents []ghEvent
 	for page := 1; page <= 3; page++ {
 		out, err := runCommand("gh", "api",
@@ -38,13 +40,11 @@ func fetchGitHubEvents(user string, since time.Time, cfg *Config) ([]Activity, e
 	}
 
 	var activities []Activity
+	var observations []Observation
 	infoCache := make(map[string]*prInfo) // "owner/repo#123" -> info
 	forkCache := make(map[string]string)  // "owner/repo" -> parent slug or ""
 
 	for _, e := range allEvents {
-		if e.CreatedAt.Before(since) {
-			continue
-		}
 		acts := convertEvent(e, cfg, user, forkCache)
 		for i := range acts {
 			if acts[i].Number == 0 {
@@ -57,12 +57,26 @@ func fetchGitHubEvents(user string, since time.Time, cfg *Config) ([]Activity, e
 			if acts[i].Title == "" {
 				acts[i].Title = info.Title
 			}
-			// If we reviewed a PR and it's now merged, record the merge.
 			if acts[i].Kind == "pr_reviewed" && info.Merged {
 				acts[i].Kind = "pr_review_merged"
 			}
 		}
-		activities = append(activities, acts...)
+
+		// Store observation for every event (regardless of since filter).
+		if obs := ghEventToObservation(e, acts, forkCache, user, cfg); obs != nil {
+			observations = append(observations, *obs)
+		}
+
+		// Only include in current report if within the time range.
+		if !e.CreatedAt.Before(since) {
+			activities = append(activities, acts...)
+		}
+	}
+
+	if db != nil && len(observations) > 0 {
+		if err := insertObservations(db, observations); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: store GitHub observations: %v\n", err)
+		}
 	}
 
 	return activities, nil
@@ -286,9 +300,56 @@ func resolveGitHubRepo(repo, user string, cfg *Config, forkCache map[string]stri
 	return repo, false
 }
 
+// ghEventToObservation converts a GitHub event into a database observation.
+func ghEventToObservation(e ghEvent, acts []Activity, forkCache map[string]string, user string, cfg *Config) *Observation {
+	if len(acts) == 0 {
+		return nil
+	}
+	a := acts[0] // Use the first activity for repo/work classification.
+
+	// Build source-specific data.
+	data := map[string]any{
+		"event_type": e.Type,
+	}
+	if e.Payload.Action != "" {
+		data["action"] = e.Payload.Action
+	}
+	if a.Number > 0 {
+		data["number"] = a.Number
+	}
+	if a.Title != "" {
+		data["title"] = a.Title
+	}
+	if a.URL != "" {
+		data["url"] = a.URL
+	}
+	if a.Details != "" {
+		data["details"] = a.Details
+	}
+	if a.Kind != "" {
+		data["kind"] = a.Kind
+	}
+	data["is_author"] = a.IsAuthor
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil
+	}
+
+	return &Observation{
+		Source:   "github",
+		SourceID: e.ID,
+		Time:     e.CreatedAt,
+		Repo:     a.Repo,
+		Work:     a.Work,
+		Data:     jsonData,
+	}
+}
+
 // GitHub event JSON structures (only the fields we need).
 
 type ghEvent struct {
+	ID        string    `json:"id"`
 	Type      string    `json:"type"`
 	CreatedAt time.Time `json:"created_at"`
 	Repo      ghRepo    `json:"repo"`

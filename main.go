@@ -36,21 +36,29 @@ func main() {
 		cfg = &Config{}
 	}
 
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not open database: %v\n", err)
+	}
+	if db != nil {
+		defer db.Close()
+	}
+
 	var activities []Activity
 
-	ghActivities, err := fetchGitHubEvents(*user, cutoff, cfg)
+	ghActivities, err := fetchGitHubEvents(*user, cutoff, cfg, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: GitHub events: %v\n", err)
 	}
 	activities = append(activities, ghActivities...)
 
-	gitActivities, err := scanGitRepos(*repos, cutoff, cfg)
+	gitActivities, err := scanGitRepos(*repos, cutoff, cfg, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: git repos: %v\n", err)
 	}
 	activities = append(activities, gitActivities...)
 
-	sessionActivities, err := scanSessions(cutoff, cfg)
+	sessionActivities, err := scanSessions(cutoff, cfg, db)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: Claude sessions: %v\n", err)
 	}

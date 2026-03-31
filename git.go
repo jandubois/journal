@@ -1,6 +1,8 @@
 package main
 
 import (
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +11,7 @@ import (
 )
 
 // scanGitRepos scans all git repos under dir for recent commits by the configured author.
-func scanGitRepos(dir string, since time.Time, cfg *Config) ([]Activity, error) {
+func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", dir, err)
@@ -43,6 +45,10 @@ func scanGitRepos(dir string, since time.Time, cfg *Config) ([]Activity, error) 
 			continue
 		}
 		activities = append(activities, acts...)
+
+		if db != nil {
+			storeGitObservations(db, acts)
+		}
 	}
 
 	return activities, nil
@@ -81,6 +87,7 @@ func scanOneRepo(repoPath, author, since string, cfg *Config) ([]Activity, error
 			Time:     t,
 			Kind:     "commit",
 			Repo:     repo,
+			URL:      parts[0], // commit hash, used as source ID for observations
 			Details:  parts[2],
 			IsAuthor: true,
 			Work:     work,
@@ -151,4 +158,30 @@ func isWorkDir(repoPath string, cfg *Config) bool {
 	}
 
 	return false
+}
+
+func storeGitObservations(db *sql.DB, activities []Activity) {
+	var observations []Observation
+	for _, a := range activities {
+		data, err := json.Marshal(map[string]any{
+			"hash":    a.URL, // commit hash stored in URL field
+			"message": a.Details,
+		})
+		if err != nil {
+			continue
+		}
+		observations = append(observations, Observation{
+			Source:   "git",
+			SourceID: a.URL, // commit hash
+			Time:     a.Time,
+			Repo:     a.Repo,
+			Work:     a.Work,
+			Data:     data,
+		})
+	}
+	if len(observations) > 0 {
+		if err := insertObservations(db, observations); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: store git observations: %v\n", err)
+		}
+	}
 }

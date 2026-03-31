@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,7 @@ import (
 )
 
 // scanSessions reads Claude Code session JSONL files and extracts activity metadata.
-func scanSessions(since time.Time, cfg *Config) ([]Activity, error) {
+func scanSessions(since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, err
@@ -24,6 +25,7 @@ func scanSessions(since time.Time, cfg *Config) ([]Activity, error) {
 	}
 
 	var activities []Activity
+	var observations []Observation
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
@@ -31,35 +33,50 @@ func scanSessions(since time.Time, cfg *Config) ([]Activity, error) {
 		projDir := filepath.Join(projectsDir, entry.Name())
 		projName := projectDirToName(entry.Name())
 
-		acts, err := scanProjectSessions(projDir, projName, since, cfg)
+		acts, obs, err := scanProjectSessions(projDir, projName, since, cfg)
 		if err != nil {
 			continue
 		}
 		activities = append(activities, acts...)
+		observations = append(observations, obs...)
+	}
+
+	if db != nil && len(observations) > 0 {
+		if err := insertObservations(db, observations); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: store session observations: %v\n", err)
+		}
 	}
 
 	return activities, nil
 }
 
-func scanProjectSessions(projDir, projName string, since time.Time, cfg *Config) ([]Activity, error) {
+func scanProjectSessions(projDir, projName string, since time.Time, cfg *Config) ([]Activity, []Observation, error) {
 	entries, err := os.ReadDir(projDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var activities []Activity
+	var observations []Observation
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
 		}
 
+		sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
 		path := filepath.Join(projDir, entry.Name())
-		a, err := parseSessionFile(path, projName, cfg)
+		a, prompts, err := parseSessionFile(path, projName, cfg)
 		if err != nil || a == nil {
 			continue
 		}
 
-		// Filter by time range: session must overlap with the since cutoff.
+		// Store observation for every session (regardless of since filter).
+		obs := sessionToObservation(sessionID, projDir, a, prompts)
+		if obs != nil {
+			observations = append(observations, *obs)
+		}
+
+		// Only include in current report if within the time range.
 		sessionEnd := a.Time.Add(a.Duration)
 		if sessionEnd.Before(since) {
 			continue
@@ -68,13 +85,13 @@ func scanProjectSessions(projDir, projName string, since time.Time, cfg *Config)
 		activities = append(activities, *a)
 	}
 
-	return activities, nil
+	return activities, observations, nil
 }
 
-func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
+func parseSessionFile(path, projName string, cfg *Config) (*Activity, []string, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 
@@ -132,7 +149,7 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
 	}
 
 	if firstTime.IsZero() {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Build a summary from the first prompt.
@@ -154,7 +171,7 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
 		Repo:     repo,
 		Details:  details,
 		Work:     work,
-	}, nil
+	}, prompts, nil
 }
 
 // extractPromptText pulls the first text block from a message content array.
@@ -271,6 +288,26 @@ func projectIsWork(projName string, cfg *Config) bool {
 	}
 	// If no local repo, check if the project name matches a work org.
 	return cfg.isWorkRepo(projName)
+}
+
+func sessionToObservation(sessionID, projDir string, a *Activity, prompts []string) *Observation {
+	data, err := json.Marshal(map[string]any{
+		"session_id":       sessionID,
+		"project_dir":      filepath.Base(projDir),
+		"duration_seconds":  int(a.Duration.Seconds()),
+		"prompts":          prompts,
+	})
+	if err != nil {
+		return nil
+	}
+	return &Observation{
+		Source:   "session",
+		SourceID: sessionID,
+		Time:     a.Time,
+		Repo:     a.Repo,
+		Work:     a.Work,
+		Data:     data,
+	}
 }
 
 type sessionMessage struct {
