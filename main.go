@@ -324,8 +324,10 @@ func parseSince(s string) (time.Time, error) {
 		return now.AddDate(0, 0, -n), nil
 	case 'w':
 		return now.AddDate(0, 0, -n*7), nil
+	case 'm':
+		return now.AddDate(0, -n, 0), nil
 	default:
-		return time.Time{}, fmt.Errorf("unknown unit %q (use d or w)", string(unit))
+		return time.Time{}, fmt.Errorf("unknown unit %q (use d, w, or m)", string(unit))
 	}
 }
 

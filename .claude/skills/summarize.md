@@ -4,11 +4,11 @@ Generate AI summaries for journal events that lack them.
 
 ## When to use
 
-Invoke with `/summarize` when the user wants to enrich their journal report with AI-generated descriptions. The skill processes events in batches, most recent first.
+Invoke with `/summarize` or `/summarize 2w` to enrich journal reports with AI-generated descriptions. The argument sets the time range (default: `1w`). The skill processes events in batches, most recent first.
 
 ## How it works
 
-1. Run `./journal pending --since 1w --limit 10` to get events needing summaries
+1. Run `./journal pending --since <range> --limit 10` to get events needing summaries (use the range from the argument, or `1w` if none)
 2. For each event, run `./journal observations --event <id>` to get the raw observations
 3. For session observations with an `archive_path`, read excerpts from the archived JSONL to understand what was done
 4. Generate a concise, one-line summary that describes *what was accomplished*, not just *what happened*
