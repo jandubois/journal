@@ -144,9 +144,13 @@ func renderTextRepoLevel(w io.Writer, t *Topic) {
 		fmt.Fprintf(w, "  - %s  %s\n", timeStr, desc)
 	}
 
-	if len(sessions) > 0 {
-		fmt.Fprintln(w, "Claude sessions:")
-		for _, a := range sessions {
+	hasVisibleSessions := false
+	for _, a := range sessions {
+		if a.Details != "" {
+			if !hasVisibleSessions {
+				fmt.Fprintln(w, "Claude sessions:")
+				hasVisibleSessions = true
+			}
 			renderTextSession(w, a)
 		}
 	}
@@ -154,19 +158,18 @@ func renderTextRepoLevel(w io.Writer, t *Topic) {
 	if t.NextStep != "" {
 		fmt.Fprintf(w, "  → %s\n", t.NextStep)
 	}
-	if len(nonSession)+len(sessions) > 0 {
+	if len(nonSession) > 0 || hasVisibleSessions {
 		fmt.Fprintln(w)
 	}
 }
 
 func renderTextSession(w io.Writer, a Activity) {
+	if a.Details == "" {
+		return
+	}
 	timeStr := a.Time.Local().Format("15:04")
 	durStr := formatDuration(a.Duration)
-	if a.Details != "" {
-		fmt.Fprintf(w, "  - %s  (%s) %s\n", timeStr, durStr, a.Details)
-	} else {
-		fmt.Fprintf(w, "  - %s  (%s)\n", timeStr, durStr)
-	}
+	fmt.Fprintf(w, "  - %s  (%s) %s\n", timeStr, durStr, a.Details)
 }
 
 func renderMarkdown(w io.Writer, topics []*Topic) {
@@ -301,16 +304,16 @@ func renderMarkdownRepoLevel(w io.Writer, t *Topic) {
 		fmt.Fprintf(w, "- %s  %s\n", timeStr, desc)
 	}
 
-	if len(sessions) > 0 {
-		fmt.Fprintln(w, "\n**Claude sessions:**")
-		for _, a := range sessions {
+	hasVisibleSessions := false
+	for _, a := range sessions {
+		if a.Details != "" {
+			if !hasVisibleSessions {
+				fmt.Fprintln(w, "\n**Claude sessions:**")
+				hasVisibleSessions = true
+			}
 			timeStr := a.Time.Local().Format("15:04")
 			durStr := formatDuration(a.Duration)
-			if a.Details != "" {
-				fmt.Fprintf(w, "- %s  (%s) %s\n", timeStr, durStr, a.Details)
-			} else {
-				fmt.Fprintf(w, "- %s  (%s)\n", timeStr, durStr)
-			}
+			fmt.Fprintf(w, "- %s  (%s) %s\n", timeStr, durStr, a.Details)
 		}
 	}
 
