@@ -53,6 +53,7 @@ func scanOneRepo(repoPath, author, since string, cfg *Config) ([]Activity, error
 		"--author="+author,
 		"--since="+since,
 		"--all",
+		"--no-merges",
 		"--format=%H|%aI|%s",
 	)
 	if err != nil {

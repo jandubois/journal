@@ -78,8 +78,14 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
 	}
 	defer f.Close()
 
-	var firstTime, lastTime time.Time
+	var firstTime, prevTime time.Time
+	var activeDuration time.Duration
 	var prompts []string
+
+	// Gap threshold: if more than 10 minutes pass between messages,
+	// assume the user was away. This gives a more accurate "active" duration
+	// for sessions that span multiple days or have long idle periods.
+	const gapThreshold = 10 * time.Minute
 
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 256*1024), 1024*1024)
@@ -107,12 +113,15 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
 			}
 		}
 
-		if firstTime.IsZero() || t.Before(firstTime) {
+		if firstTime.IsZero() {
 			firstTime = t
+		} else if !prevTime.IsZero() {
+			gap := t.Sub(prevTime)
+			if gap <= gapThreshold {
+				activeDuration += gap
+			}
 		}
-		if t.After(lastTime) {
-			lastTime = t
-		}
+		prevTime = t
 
 		if msg.Type == "user" {
 			prompt := extractPromptText(msg.Message)
@@ -140,7 +149,7 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, error) {
 
 	return &Activity{
 		Time:     firstTime,
-		Duration: lastTime.Sub(firstTime),
+		Duration: activeDuration,
 		Kind:     "session",
 		Repo:     repo,
 		Details:  details,

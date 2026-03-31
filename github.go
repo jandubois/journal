@@ -138,12 +138,17 @@ func convertEvent(e ghEvent, cfg *Config, user string, forkCache map[string]stri
 		return []Activity{a}
 
 	case "PushEvent":
-		a := base
-		a.Kind = "pushed"
 		ref := e.Payload.Ref
 		if strings.HasPrefix(ref, "refs/heads/") {
 			ref = ref[len("refs/heads/"):]
 		}
+		// Skip pushes to default branches — these are merge side-effects
+		// already captured by PullRequestEvent.
+		if ref == "main" || ref == "master" {
+			return nil
+		}
+		a := base
+		a.Kind = "pushed"
 		commits := make([]string, 0, len(e.Payload.Commits))
 		for _, c := range e.Payload.Commits {
 			msg := c.Message
@@ -178,11 +183,8 @@ func convertEvent(e ghEvent, cfg *Config, user string, forkCache map[string]stri
 		return []Activity{a}
 
 	case "DeleteEvent":
-		a := base
-		a.Kind = "branch_deleted"
-		a.Details = e.Payload.Ref
-		a.IsAuthor = true
-		return []Activity{a}
+		// Branch deletes are noise in a standup context.
+		return nil
 	}
 
 	return nil
