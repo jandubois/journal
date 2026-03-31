@@ -304,6 +304,8 @@ func isSystemPrompt(prompt string) bool {
 	systemPrefixes := []string{
 		"Base directory for this skill:",
 		"<command-message>",
+		"<task-notification>",
+		"You are performing a deep code review.",
 		"/init",
 	}
 	for _, prefix := range systemPrefixes {
