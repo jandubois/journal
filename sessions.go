@@ -121,6 +121,12 @@ func scanSubagentSessions(sessionDir, parentSessionID, projName, repo, archiveDi
 			continue
 		}
 
+		// The first "user" message in a subagent is the delegation prompt
+		// from the parent, not a real user prompt.
+		if len(prompts) > 0 {
+			prompts = prompts[1:]
+		}
+
 		// Archive under the same project, with parent session prefix.
 		archiveSubDir := filepath.Join(projName, parentSessionID)
 		archivePath := archiveSessionFile(srcPath, archiveSubDir, agentID, archiveDir)
@@ -261,22 +267,35 @@ func parseSessionFile(path string) (startTime time.Time, duration time.Duration,
 	return
 }
 
-// extractPromptText pulls the full text from a message content array.
+// extractPromptText pulls the first user text from a message.
+// Content may be a plain string or an array of {type, text} blocks.
 func extractPromptText(raw json.RawMessage) string {
 	var msg struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
+		Content json.RawMessage `json:"content"`
 	}
-	if err := json.Unmarshal(raw, &msg); err != nil {
+	if err := json.Unmarshal(raw, &msg); err != nil || msg.Content == nil {
 		return ""
 	}
-	for _, block := range msg.Content {
-		if block.Type == "text" && block.Text != "" {
-			return strings.TrimSpace(block.Text)
+
+	// Try string form first: {"content": "some text"}
+	var text string
+	if json.Unmarshal(msg.Content, &text) == nil {
+		return strings.TrimSpace(text)
+	}
+
+	// Try array form: {"content": [{"type": "text", "text": "..."}]}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(msg.Content, &blocks) == nil {
+		for _, b := range blocks {
+			if b.Type == "text" && b.Text != "" {
+				return strings.TrimSpace(b.Text)
+			}
 		}
 	}
+
 	return ""
 }
 
@@ -284,6 +303,7 @@ func extractPromptText(raw json.RawMessage) string {
 func isSystemPrompt(prompt string) bool {
 	systemPrefixes := []string{
 		"Base directory for this skill:",
+		"<command-message>",
 		"/init",
 	}
 	for _, prefix := range systemPrefixes {
