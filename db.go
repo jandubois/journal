@@ -616,7 +616,7 @@ func queryPendingSummaries(db *sql.DB, since time.Time, limit int) ([]PendingEve
 		  AND NOT EXISTS (
 		    SELECT 1 FROM ai_summaries a
 		    WHERE a.repo = e.repo AND a.number = COALESCE(e.number, 0)
-		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(e.timestamp, 1, 10) ELSE '' END
+		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(datetime(e.timestamp, 'localtime'), 1, 10) ELSE '' END
 		  )`,
 		sinceStr,
 	).Scan(&total)
@@ -633,7 +633,7 @@ func queryPendingSummaries(db *sql.DB, since time.Time, limit int) ([]PendingEve
 		  AND NOT EXISTS (
 		    SELECT 1 FROM ai_summaries a
 		    WHERE a.repo = e.repo AND a.number = COALESCE(e.number, 0)
-		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(e.timestamp, 1, 10) ELSE '' END
+		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(datetime(e.timestamp, 'localtime'), 1, 10) ELSE '' END
 		  )
 		ORDER BY e.timestamp DESC
 		LIMIT ?`,
@@ -654,7 +654,9 @@ func queryPendingSummaries(db *sql.DB, since time.Time, limit int) ([]PendingEve
 		}
 		e.Work = work != 0
 		if e.Number == 0 {
-			e.Period = ts[:10] // date portion
+			if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+				e.Period = t.Local().Format("2006-01-02")
+			}
 		}
 		events = append(events, e)
 	}

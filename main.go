@@ -239,7 +239,7 @@ func topicPeriod(t *Topic) string {
 	if len(t.Activities) == 0 {
 		return ""
 	}
-	return t.Activities[0].Time.Format("2006-01-02")
+	return t.Activities[0].Time.Local().Format("2006-01-02")
 }
 
 func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observation, cfg *Config, user string) {
