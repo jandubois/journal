@@ -85,7 +85,10 @@ func renderTextTopic(w io.Writer, t *Topic) {
 
 	// Compact rendering for done topics: one line per topic.
 	if t.NextStep == "Done" {
-		action := summarizeActions(t)
+		action := t.AISummary
+		if action == "" {
+			action = summarizeActions(t)
+		}
 		if t.Title != "" {
 			fmt.Fprintf(w, "%s%d: %s — %s\n", prefix, t.Number, t.Title, action)
 		} else {
@@ -98,6 +101,9 @@ func renderTextTopic(w io.Writer, t *Topic) {
 		fmt.Fprintf(w, "%s%d: %s\n", prefix, t.Number, t.Title)
 	} else {
 		fmt.Fprintf(w, "%s%d\n", prefix, t.Number)
+	}
+	if t.AISummary != "" {
+		fmt.Fprintf(w, "  %s\n", t.AISummary)
 	}
 
 	for _, a := range t.Activities {

@@ -28,6 +28,7 @@ type Topic struct {
 	Work       bool
 	Activities []Activity
 	NextStep   string
+	AISummary  string // AI-generated summary, empty if not yet summarized
 }
 
 // topicKey returns a grouping key for an activity.

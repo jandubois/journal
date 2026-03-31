@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,21 @@ import (
 )
 
 func main() {
+	// Check for subcommands before flag parsing.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "pending":
+			cmdPending(os.Args[2:])
+			return
+		case "set-summary":
+			cmdSetSummary(os.Args[2:])
+			return
+		case "observations":
+			cmdObservations(os.Args[2:])
+			return
+		}
+	}
+
 	since := flag.String("since", "1d", "how far back to look (1d, 2d, 1w, or ISO date)")
 	format := flag.String("format", "text", "output format: text or markdown")
 	repos := flag.String("repos", defaultReposDir(), "directory containing git repos")
@@ -45,10 +61,8 @@ func main() {
 	}
 	defer db.Close()
 
-	// Collect: fetch latest data from all sources into the database.
 	collect(*user, *repos, cfg, db)
 
-	// Process: convert observations into grouped events.
 	observations, err := queryObservations(db, cutoff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: query observations: %v\n", err)
@@ -57,14 +71,15 @@ func main() {
 	activities := observationsToActivities(observations, cfg, *user)
 	topics := groupActivities(activities)
 
-	// Load full history for numbered topics so next-step inference
-	// sees the complete picture (e.g. a PR opened last week but reviewed today).
 	enrichTopicsWithHistory(db, topics, observations, cfg, *user)
 	inferNextSteps(topics)
 
 	if err := processEvents(db, topics); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: process events: %v\n", err)
 	}
+
+	// Apply AI summaries where available.
+	applyAISummaries(db, topics)
 
 	switch *format {
 	case "text":
@@ -77,21 +92,126 @@ func main() {
 	}
 }
 
-// collect fetches latest data from all sources and writes observations to the database.
-// It fetches broadly (not limited to the --since range) to capture as much as possible.
-// enrichTopicsWithHistory loads full observation history for numbered topics
-// (PRs, issues) so that next-step inference sees events from before the --since
-// window. Without this, a PR opened last week but reviewed today would appear
-// as if the user is only a reviewer, yielding wrong next steps.
+// cmdPending outputs events that lack AI summaries, as JSON for the /summarize skill.
+func cmdPending(args []string) {
+	fs := flag.NewFlagSet("pending", flag.ExitOnError)
+	since := fs.String("since", "1w", "how far back to look")
+	limit := fs.Int("limit", 10, "maximum events to return")
+	fs.Parse(args)
+
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	cutoff, err := parseSince(*since)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid --since: %v\n", err)
+		os.Exit(1)
+	}
+
+	pending, total, err := queryPendingSummaries(db, cutoff, *limit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	output := map[string]any{
+		"events":          pending,
+		"returned":        len(pending),
+		"total_pending":   total,
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.Encode(output)
+}
+
+// cmdSetSummary stores an AI-generated summary for a topic.
+func cmdSetSummary(args []string) {
+	fs := flag.NewFlagSet("set-summary", flag.ExitOnError)
+	repo := fs.String("repo", "", "repository slug")
+	number := fs.Int("number", 0, "PR/issue number (0 for repo-level)")
+	period := fs.String("period", "", "time period for repo-level events")
+	fs.Parse(args)
+
+	summary := strings.Join(fs.Args(), " ")
+	if *repo == "" || summary == "" {
+		fmt.Fprintf(os.Stderr, "usage: journal set-summary --repo OWNER/REPO [--number N] [--period DATE] SUMMARY\n")
+		os.Exit(1)
+	}
+
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	if err := storeAISummary(db, *repo, *number, *period, summary); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// cmdObservations outputs raw observations for a specific event, for the /summarize skill.
+func cmdObservations(args []string) {
+	fs := flag.NewFlagSet("observations", flag.ExitOnError)
+	eventID := fs.Int("event", 0, "event ID to show observations for")
+	fs.Parse(args)
+
+	if *eventID == 0 {
+		fmt.Fprintf(os.Stderr, "usage: journal observations --event ID\n")
+		os.Exit(1)
+	}
+
+	db, err := openDB()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	defer db.Close()
+
+	obs, err := queryEventObservations(db, int64(*eventID))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	enc.Encode(obs)
+}
+
+// applyAISummaries looks up AI summaries for each topic and applies them.
+func applyAISummaries(db *sql.DB, topics []*Topic) {
+	for _, t := range topics {
+		period := topicPeriod(t)
+		summary, err := getAISummary(db, t.Repo, t.Number, period)
+		if err != nil || summary == "" {
+			continue
+		}
+		t.AISummary = summary
+	}
+}
+
+func topicPeriod(t *Topic) string {
+	if t.Number > 0 {
+		return ""
+	}
+	if len(t.Activities) == 0 {
+		return ""
+	}
+	return t.Activities[0].Time.Format("2006-01-02")
+}
+
 func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observation, cfg *Config, user string) {
-	// Build a map from ObservationID → raw repo slug. Activities carry the
-	// resolved slug; we need the raw slug to query the observations table.
 	rawRepoByObsID := make(map[int64]string)
 	for _, o := range observations {
 		rawRepoByObsID[o.ID] = o.Repo
 	}
 
-	// Collect (raw repo slug, number) pairs for numbered topics.
 	var repoNumbers [][2]string
 	seen := make(map[string]bool)
 	for _, t := range topics {
@@ -99,12 +219,10 @@ func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observa
 			continue
 		}
 		numStr := fmt.Sprintf("%d", t.Number)
-
-		// Find all raw repo slugs from this topic's observations.
 		for _, a := range t.Activities {
 			rawRepo := rawRepoByObsID[a.ObservationID]
 			if rawRepo == "" {
-				rawRepo = t.Repo // fallback to resolved
+				rawRepo = t.Repo
 			}
 			key := fmt.Sprintf("%s#%s", rawRepo, numStr)
 			if seen[key] {
@@ -130,7 +248,6 @@ func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observa
 
 	histActivities := observationsToActivities(histObs, cfg, user)
 
-	// Merge historical activities into existing topics.
 	existingIDs := make(map[int64]bool)
 	for _, t := range topics {
 		for _, a := range t.Activities {
@@ -153,7 +270,6 @@ func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, observations []Observa
 		}
 	}
 
-	// Re-sort activities within enriched topics.
 	for _, t := range topics {
 		sort.Slice(t.Activities, func(i, j int) bool {
 			return t.Activities[i].Time.Before(t.Activities[j].Time)
@@ -220,3 +336,4 @@ func detectGitHubUser() (string, error) {
 	}
 	return strings.TrimSpace(out), nil
 }
+

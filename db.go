@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 const schema = `
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -55,6 +55,18 @@ CREATE INDEX IF NOT EXISTS idx_observations_timestamp ON observations(timestamp)
 CREATE INDEX IF NOT EXISTS idx_observations_repo ON observations(repo);
 CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_repo ON events(repo);
+
+-- AI-generated summaries, keyed by (repo, number) to survive event rebuilds.
+-- number=0 entries use the timestamp to distinguish repo-level events from
+-- different time periods.
+CREATE TABLE IF NOT EXISTS ai_summaries (
+    repo       TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    period     TEXT NOT NULL DEFAULT '',
+    summary    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    PRIMARY KEY (repo, number, period)
+);
 `
 
 type Observation struct {
@@ -458,4 +470,128 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// AI summary storage and retrieval.
+
+func storeAISummary(db *sql.DB, repo string, number int, period, summary string) error {
+	_, err := db.Exec(
+		`INSERT OR REPLACE INTO ai_summaries (repo, number, period, summary)
+		 VALUES (?, ?, ?, ?)`,
+		repo, number, period, summary,
+	)
+	return err
+}
+
+func getAISummary(db *sql.DB, repo string, number int, period string) (string, error) {
+	var summary string
+	err := db.QueryRow(
+		`SELECT summary FROM ai_summaries WHERE repo = ? AND number = ? AND period = ?`,
+		repo, number, period,
+	).Scan(&summary)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return summary, err
+}
+
+// PendingEvent represents an event that needs AI summarization.
+type PendingEvent struct {
+	EventID  int64  `json:"event_id"`
+	Repo     string `json:"repo"`
+	Number   int    `json:"number"`
+	Title    string `json:"title"`
+	Kind     string `json:"kind"`
+	Summary  string `json:"mechanical_summary"`
+	NextStep string `json:"next_step"`
+	Period   string `json:"period"`
+	Work     bool   `json:"work"`
+}
+
+// queryPendingSummaries finds events that lack AI summaries.
+func queryPendingSummaries(db *sql.DB, since time.Time, limit int) ([]PendingEvent, int, error) {
+	sinceStr := since.UTC().Format(time.RFC3339Nano)
+
+	// Count total pending.
+	var total int
+	err := db.QueryRow(`
+		SELECT count(*)
+		FROM events e
+		WHERE e.timestamp >= ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM ai_summaries a
+		    WHERE a.repo = e.repo AND a.number = COALESCE(e.number, 0)
+		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(e.timestamp, 1, 10) ELSE '' END
+		  )`,
+		sinceStr,
+	).Scan(&total)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	// Fetch the most recent pending events.
+	rows, err := db.Query(`
+		SELECT e.id, e.repo, COALESCE(e.number, 0), COALESCE(e.title, ''), e.kind, e.summary,
+		       COALESCE(e.next_step, ''), e.work, e.timestamp
+		FROM events e
+		WHERE e.timestamp >= ?
+		  AND NOT EXISTS (
+		    SELECT 1 FROM ai_summaries a
+		    WHERE a.repo = e.repo AND a.number = COALESCE(e.number, 0)
+		      AND a.period = CASE WHEN COALESCE(e.number, 0) = 0 THEN substr(e.timestamp, 1, 10) ELSE '' END
+		  )
+		ORDER BY e.timestamp DESC
+		LIMIT ?`,
+		sinceStr, limit,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var events []PendingEvent
+	for rows.Next() {
+		var e PendingEvent
+		var work int
+		var ts string
+		if err := rows.Scan(&e.EventID, &e.Repo, &e.Number, &e.Title, &e.Kind, &e.Summary, &e.NextStep, &work, &ts); err != nil {
+			return nil, 0, err
+		}
+		e.Work = work != 0
+		if e.Number == 0 {
+			e.Period = ts[:10] // date portion
+		}
+		events = append(events, e)
+	}
+
+	return events, total, rows.Err()
+}
+
+// queryEventObservations returns all observations linked to a specific event.
+func queryEventObservations(db *sql.DB, eventID int64) ([]Observation, error) {
+	rows, err := db.Query(`
+		SELECT o.id, o.source, o.source_id, o.timestamp, o.repo, o.data
+		FROM observations o
+		JOIN event_observations eo ON o.id = eo.observation_id
+		WHERE eo.event_id = ?
+		ORDER BY o.timestamp`,
+		eventID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var observations []Observation
+	for rows.Next() {
+		var o Observation
+		var ts, dataStr string
+		if err := rows.Scan(&o.ID, &o.Source, &o.SourceID, &ts, &o.Repo, &dataStr); err != nil {
+			return nil, err
+		}
+		o.Time, _ = time.Parse(time.RFC3339Nano, ts)
+		o.Data = json.RawMessage(dataStr)
+		observations = append(observations, o)
+	}
+	return observations, rows.Err()
 }
