@@ -4,213 +4,44 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
 
-// fetchGitHubEvents retrieves the user's recent GitHub events and converts them to activities.
-func fetchGitHubEvents(user string, since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
-	var allEvents []ghEvent
-	for page := 1; page <= 3; page++ {
+// fetchGitHubEvents retrieves the user's recent GitHub events and stores them as raw observations.
+func fetchGitHubEvents(user string, db *sql.DB) error {
+	var observations []Observation
+	for page := 1; ; page++ {
 		out, err := runCommand("gh", "api",
 			fmt.Sprintf("/users/%s/events?per_page=100&page=%d", user, page),
 		)
 		if err != nil {
 			if page == 1 {
-				return nil, err
+				return err
 			}
 			break
 		}
 
 		var events []ghEvent
 		if err := json.Unmarshal([]byte(out), &events); err != nil {
-			return nil, fmt.Errorf("parse events page %d: %w", page, err)
+			return fmt.Errorf("parse events page %d: %w", page, err)
 		}
 		if len(events) == 0 {
 			break
 		}
-		allEvents = append(allEvents, events...)
 
-		// Stop paginating if the oldest event on this page is before our cutoff.
-		oldest := events[len(events)-1].CreatedAt
-		if oldest.Before(since) {
-			break
+		for _, e := range events {
+			if obs := ghEventToObservation(e); obs != nil {
+				observations = append(observations, *obs)
+			}
 		}
 	}
 
-	var activities []Activity
-	var observations []Observation
-	infoCache := make(map[string]*prInfo) // "owner/repo#123" -> info
-	forkCache := make(map[string]string)  // "owner/repo" -> parent slug or ""
-
-	for _, e := range allEvents {
-		acts := convertEvent(e, cfg, user, forkCache)
-		for i := range acts {
-			if acts[i].Number == 0 {
-				continue
-			}
-			info := fetchPRInfo(acts[i].Repo, acts[i].Number, infoCache)
-			if info == nil {
-				continue
-			}
-			if acts[i].Title == "" {
-				acts[i].Title = info.Title
-			}
-			if acts[i].Kind == "pr_reviewed" && info.Merged {
-				acts[i].Kind = "pr_review_merged"
-			}
-		}
-
-		// Store observation for every event (regardless of since filter).
-		if obs := ghEventToObservation(e, acts, forkCache, user, cfg); obs != nil {
-			observations = append(observations, *obs)
-		}
-
-		// Only include in current report if within the time range.
-		if !e.CreatedAt.Before(since) {
-			activities = append(activities, acts...)
-		}
-	}
-
-	if db != nil && len(observations) > 0 {
+	if len(observations) > 0 {
 		if err := insertObservations(db, observations); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: store GitHub observations: %v\n", err)
+			return fmt.Errorf("store observations: %w", err)
 		}
 	}
-
-	return activities, nil
-}
-
-func convertEvent(e ghEvent, cfg *Config, user string, forkCache map[string]string) []Activity {
-	repo, work := resolveGitHubRepo(e.Repo.Name, user, cfg, forkCache)
-	base := Activity{
-		Time: e.CreatedAt,
-		Repo: repo,
-		Work: work,
-	}
-
-	switch e.Type {
-	case "PullRequestEvent":
-		a := base
-		a.Number = e.Payload.Number
-		a.URL = e.Payload.PullRequest.URL
-		a.Title = e.Payload.PullRequest.Title
-		a.IsAuthor = true
-		switch e.Payload.Action {
-		case "opened":
-			a.Kind = "pr_opened"
-		case "closed":
-			if e.Payload.PullRequest.Merged {
-				a.Kind = "pr_merged"
-			} else {
-				a.Kind = "pr_closed"
-			}
-		case "reopened":
-			a.Kind = "pr_reopened"
-		default:
-			return nil
-		}
-		return []Activity{a}
-
-	case "PullRequestReviewEvent":
-		a := base
-		a.Number = e.Payload.PullRequest.Number
-		a.URL = e.Payload.PullRequest.URL
-		a.Title = e.Payload.PullRequest.Title
-		a.Kind = "pr_reviewed"
-		a.Details = e.Payload.Review.State
-		a.IsAuthor = false
-		return []Activity{a}
-
-	case "IssueCommentEvent":
-		a := base
-		a.Number = e.Payload.Issue.Number
-		a.URL = e.Payload.Issue.URL
-		a.Title = e.Payload.Issue.Title
-		if e.Payload.Issue.PullRequest != nil {
-			a.Kind = "pr_commented"
-		} else {
-			a.Kind = "issue_commented"
-		}
-		body := e.Payload.Comment.Body
-		if idx := strings.IndexByte(body, '\n'); idx > 0 {
-			body = body[:idx]
-		}
-		if len(body) > 120 {
-			body = body[:120] + "..."
-		}
-		a.Details = body
-		return []Activity{a}
-
-	case "IssuesEvent":
-		a := base
-		a.Number = e.Payload.Issue.Number
-		a.URL = e.Payload.Issue.URL
-		a.Title = e.Payload.Issue.Title
-		a.IsAuthor = true
-		switch e.Payload.Action {
-		case "opened":
-			a.Kind = "issue_opened"
-		case "closed":
-			a.Kind = "issue_closed"
-		case "reopened":
-			a.Kind = "issue_reopened"
-		default:
-			return nil
-		}
-		return []Activity{a}
-
-	case "PushEvent":
-		ref := e.Payload.Ref
-		if strings.HasPrefix(ref, "refs/heads/") {
-			ref = ref[len("refs/heads/"):]
-		}
-		// Skip pushes to default branches — these are merge side-effects
-		// already captured by PullRequestEvent.
-		if ref == "main" || ref == "master" {
-			return nil
-		}
-		a := base
-		a.Kind = "pushed"
-		commits := make([]string, 0, len(e.Payload.Commits))
-		for _, c := range e.Payload.Commits {
-			msg := c.Message
-			if idx := strings.IndexByte(msg, '\n'); idx > 0 {
-				msg = msg[:idx]
-			}
-			commits = append(commits, msg)
-		}
-		if len(commits) == 0 {
-			a.Details = fmt.Sprintf("pushed to %s", ref)
-		} else if len(commits) == 1 {
-			a.Details = fmt.Sprintf("pushed to %s: %s", ref, commits[0])
-		} else {
-			a.Details = fmt.Sprintf("pushed %d commits to %s", len(commits), ref)
-		}
-		a.IsAuthor = true
-		return []Activity{a}
-
-	case "CreateEvent":
-		a := base
-		switch e.Payload.RefType {
-		case "branch":
-			a.Kind = "branch_created"
-			a.Details = e.Payload.Ref
-		case "tag":
-			a.Kind = "tag_created"
-			a.Details = e.Payload.Ref
-		default:
-			return nil
-		}
-		a.IsAuthor = true
-		return []Activity{a}
-
-	case "DeleteEvent":
-		// Branch deletes are noise in a standup context.
-		return nil
-	}
-
 	return nil
 }
 
@@ -263,22 +94,24 @@ func fetchPRInfo(repo string, number int, cache map[string]*prInfo) *prInfo {
 }
 
 // resolveGitHubRepo maps a repo slug to its canonical name and work classification.
-// Forks of work repos are remapped to the parent slug so activities group together.
+// Forks are remapped to the parent slug so activities group together.
 func resolveGitHubRepo(repo, user string, cfg *Config, forkCache map[string]string) (string, bool) {
-	if cfg.isWorkRepo(repo) {
-		return repo, true
-	}
-
-	// If the repo owner is the user, check if it's a fork of a work repo.
-	owner, _, ok := strings.Cut(repo, "/")
-	if !ok || !strings.EqualFold(owner, user) {
-		return repo, false
-	}
-
+	// Check cache first.
 	if parent, ok := forkCache[repo]; ok {
 		if parent != "" {
-			return parent, true
+			return parent, cfg.isWorkRepo(parent)
 		}
+		return repo, cfg.isWorkRepo(repo)
+	}
+
+	// Only check for fork parents on repos owned by the user or a work org.
+	// Repos from unknown orgs are kept as-is.
+	owner, _, ok := strings.Cut(repo, "/")
+	if !ok {
+		return repo, false
+	}
+	isUserOrWork := strings.EqualFold(owner, user) || cfg.isWorkRepo(repo)
+	if !isUserOrWork {
 		return repo, false
 	}
 
@@ -288,48 +121,92 @@ func resolveGitHubRepo(repo, user string, cfg *Config, forkCache map[string]stri
 	)
 	if err != nil {
 		forkCache[repo] = ""
-		return repo, false
+		return repo, cfg.isWorkRepo(repo)
 	}
 
 	parent := strings.TrimSpace(out)
-	if parent != "" && cfg.isWorkRepo(parent) {
+	if parent != "" {
 		forkCache[repo] = parent
-		return parent, true
+		return parent, cfg.isWorkRepo(parent)
 	}
 	forkCache[repo] = ""
-	return repo, false
+	return repo, cfg.isWorkRepo(repo)
 }
 
-// ghEventToObservation converts a GitHub event into a database observation.
-func ghEventToObservation(e ghEvent, acts []Activity, forkCache map[string]string, user string, cfg *Config) *Observation {
-	if len(acts) == 0 {
-		return nil
-	}
-	a := acts[0] // Use the first activity for repo/work classification.
-
-	// Build source-specific data.
+// ghEventToObservation converts a raw GitHub event into a database observation.
+// Stores raw event data without interpretation — no fork resolution, no work
+// classification, no PR state enrichment.
+func ghEventToObservation(e ghEvent) *Observation {
 	data := map[string]any{
 		"event_type": e.Type,
 	}
 	if e.Payload.Action != "" {
 		data["action"] = e.Payload.Action
 	}
-	if a.Number > 0 {
-		data["number"] = a.Number
+
+	// Extract fields based on event type.
+	switch e.Type {
+	case "PullRequestEvent":
+		data["number"] = e.Payload.Number
+		data["url"] = e.Payload.PullRequest.URL
+		data["title"] = e.Payload.PullRequest.Title
+		data["merged"] = e.Payload.PullRequest.Merged
+		data["is_author"] = true
+
+	case "PullRequestReviewEvent":
+		data["number"] = e.Payload.PullRequest.Number
+		data["url"] = e.Payload.PullRequest.URL
+		data["title"] = e.Payload.PullRequest.Title
+		data["details"] = e.Payload.Review.State
+		data["is_author"] = false
+
+	case "IssueCommentEvent":
+		data["number"] = e.Payload.Issue.Number
+		data["url"] = e.Payload.Issue.URL
+		data["title"] = e.Payload.Issue.Title
+		data["is_pull_request"] = e.Payload.Issue.PullRequest != nil
+		body := e.Payload.Comment.Body
+		if idx := strings.IndexByte(body, '\n'); idx > 0 {
+			body = body[:idx]
+		}
+		if len(body) > 120 {
+			body = body[:120] + "..."
+		}
+		data["details"] = body
+
+	case "IssuesEvent":
+		data["number"] = e.Payload.Issue.Number
+		data["url"] = e.Payload.Issue.URL
+		data["title"] = e.Payload.Issue.Title
+		data["is_author"] = true
+
+	case "PushEvent":
+		ref := e.Payload.Ref
+		if strings.HasPrefix(ref, "refs/heads/") {
+			ref = ref[len("refs/heads/"):]
+		}
+		data["ref"] = ref
+		commits := make([]string, 0, len(e.Payload.Commits))
+		for _, c := range e.Payload.Commits {
+			msg := c.Message
+			if idx := strings.IndexByte(msg, '\n'); idx > 0 {
+				msg = msg[:idx]
+			}
+			commits = append(commits, msg)
+		}
+		data["commits"] = commits
+		data["is_author"] = true
+
+	case "CreateEvent":
+		data["ref"] = e.Payload.Ref
+		data["ref_type"] = e.Payload.RefType
+		data["is_author"] = true
+
+	case "DeleteEvent":
+		data["ref"] = e.Payload.Ref
+		data["ref_type"] = e.Payload.RefType
+		data["is_author"] = true
 	}
-	if a.Title != "" {
-		data["title"] = a.Title
-	}
-	if a.URL != "" {
-		data["url"] = a.URL
-	}
-	if a.Details != "" {
-		data["details"] = a.Details
-	}
-	if a.Kind != "" {
-		data["kind"] = a.Kind
-	}
-	data["is_author"] = a.IsAuthor
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -340,8 +217,7 @@ func ghEventToObservation(e ghEvent, acts []Activity, forkCache map[string]strin
 		Source:   "github",
 		SourceID: e.ID,
 		Time:     e.CreatedAt,
-		Repo:     a.Repo,
-		Work:     a.Work,
+		Repo:     e.Repo.Name, // Raw repo slug, no fork resolution.
 		Data:     jsonData,
 	}
 }

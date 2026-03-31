@@ -53,7 +53,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: query observations: %v\n", err)
 		os.Exit(1)
 	}
-	activities := observationsToActivities(observations)
+	activities := observationsToActivities(observations, cfg, *user)
 
 	topics := groupActivities(activities)
 	inferNextSteps(topics)
@@ -72,19 +72,16 @@ func main() {
 // collect fetches latest data from all sources and writes observations to the database.
 // It fetches broadly (not limited to the --since range) to capture as much as possible.
 func collect(user, reposDir string, cfg *Config, db *sql.DB) {
-	// GitHub: fetch all available events (API returns up to 90 days / 300 events).
-	if _, err := fetchGitHubEvents(user, time.Time{}, cfg, db); err != nil {
+	if err := fetchGitHubEvents(user, db); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: GitHub events: %v\n", err)
 	}
 
-	// Git: scan for recent commits (last 90 days to match GitHub range).
 	gitCutoff := time.Now().AddDate(0, -3, 0)
-	if _, err := scanGitRepos(reposDir, gitCutoff, cfg, db); err != nil {
+	if err := scanGitRepos(reposDir, gitCutoff, cfg, db); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: git repos: %v\n", err)
 	}
 
-	// Sessions: scan all available session files.
-	if _, err := scanSessions(time.Time{}, cfg, db); err != nil {
+	if err := scanSessions(db); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: Claude sessions: %v\n", err)
 	}
 }

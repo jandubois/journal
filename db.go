@@ -6,22 +6,28 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
 )
 
+const schemaVersion = 2
+
 const schema = `
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS observations (
     id           INTEGER PRIMARY KEY,
     source       TEXT NOT NULL,
     source_id    TEXT NOT NULL,
     timestamp    TEXT NOT NULL,
     repo         TEXT,
-    work         INTEGER NOT NULL,
     data         TEXT NOT NULL,
     collected_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    UNIQUE(source, source_id)
+    UNIQUE(source, source_id, repo)
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -56,7 +62,6 @@ type Observation struct {
 	SourceID string          `json:"source_id"`
 	Time     time.Time       `json:"time"`
 	Repo     string          `json:"repo"`
-	Work     bool            `json:"work"`
 	Data     json.RawMessage `json:"data"`
 }
 
@@ -64,6 +69,16 @@ func openDB() (*sql.DB, error) {
 	dbPath := dbFilePath()
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
+	}
+
+	// Check if existing DB has a different schema version and delete if so.
+	if _, err := os.Stat(dbPath); err == nil {
+		if needsReset(dbPath) {
+			os.Remove(dbPath)
+			// Also remove WAL and SHM files.
+			os.Remove(dbPath + "-wal")
+			os.Remove(dbPath + "-shm")
+		}
 	}
 
 	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(on)")
@@ -76,7 +91,26 @@ func openDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
+	// Set schema version.
+	db.Exec("DELETE FROM schema_version")
+	db.Exec("INSERT INTO schema_version (version) VALUES (?)", schemaVersion)
+
 	return db, nil
+}
+
+func needsReset(dbPath string) bool {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return true
+	}
+	defer db.Close()
+
+	var version int
+	err = db.QueryRow("SELECT version FROM schema_version LIMIT 1").Scan(&version)
+	if err != nil || version != schemaVersion {
+		return true
+	}
+	return false
 }
 
 func dbFilePath() string {
@@ -94,13 +128,12 @@ func dbFilePath() string {
 
 func insertObservation(db *sql.DB, o Observation) error {
 	_, err := db.Exec(
-		`INSERT OR IGNORE INTO observations (source, source_id, timestamp, repo, work, data)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO observations (source, source_id, timestamp, repo, data)
+		 VALUES (?, ?, ?, ?, ?)`,
 		o.Source,
 		o.SourceID,
 		o.Time.UTC().Format(time.RFC3339Nano),
 		o.Repo,
-		boolToInt(o.Work),
 		string(o.Data),
 	)
 	return err
@@ -114,8 +147,8 @@ func insertObservations(db *sql.DB, observations []Observation) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(
-		`INSERT OR IGNORE INTO observations (source, source_id, timestamp, repo, work, data)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT OR IGNORE INTO observations (source, source_id, timestamp, repo, data)
+		 VALUES (?, ?, ?, ?, ?)`,
 	)
 	if err != nil {
 		return err
@@ -128,7 +161,6 @@ func insertObservations(db *sql.DB, observations []Observation) error {
 			o.SourceID,
 			o.Time.UTC().Format(time.RFC3339Nano),
 			o.Repo,
-			boolToInt(o.Work),
 			string(o.Data),
 		)
 		if err != nil {
@@ -142,7 +174,7 @@ func insertObservations(db *sql.DB, observations []Observation) error {
 func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	sinceStr := since.UTC().Format(time.RFC3339Nano)
 	rows, err := db.Query(
-		`SELECT source, source_id, timestamp, repo, work, data
+		`SELECT source, source_id, timestamp, repo, data
 		 FROM observations
 		 WHERE timestamp >= ?
 		 ORDER BY timestamp`,
@@ -157,23 +189,25 @@ func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	for rows.Next() {
 		var o Observation
 		var ts, dataStr string
-		var work int
-		if err := rows.Scan(&o.Source, &o.SourceID, &ts, &o.Repo, &work, &dataStr); err != nil {
+		if err := rows.Scan(&o.Source, &o.SourceID, &ts, &o.Repo, &dataStr); err != nil {
 			return nil, err
 		}
 		o.Time, _ = time.Parse(time.RFC3339Nano, ts)
-		o.Work = work != 0
 		o.Data = json.RawMessage(dataStr)
 		observations = append(observations, o)
 	}
 	return observations, rows.Err()
 }
 
-// observationsToActivities reconstructs Activity structs from database observations.
-func observationsToActivities(observations []Observation) []Activity {
+// observationsToActivities reconstructs Activity structs from database observations,
+// applying all interpretation: fork resolution, work classification, PR merge detection.
+func observationsToActivities(observations []Observation, cfg *Config, user string) []Activity {
+	forkCache := make(map[string]string)
+	prCache := make(map[string]*prInfo)
+
 	var activities []Activity
 	for _, o := range observations {
-		a := observationToActivity(o)
+		a := observationToActivity(o, cfg, user, forkCache, prCache)
 		if a != nil {
 			activities = append(activities, *a)
 		}
@@ -181,26 +215,78 @@ func observationsToActivities(observations []Observation) []Activity {
 	return activities
 }
 
-func observationToActivity(o Observation) *Activity {
+func observationToActivity(o Observation, cfg *Config, user string, forkCache map[string]string, prCache map[string]*prInfo) *Activity {
 	var data map[string]json.RawMessage
 	if err := json.Unmarshal(o.Data, &data); err != nil {
 		return nil
 	}
 
+	// Resolve repo: fork resolution and work classification happen here.
+	repo, work := resolveRepo(o.Repo, o.Source, user, cfg, forkCache)
+
 	a := Activity{
 		Time: o.Time,
-		Repo: o.Repo,
-		Work: o.Work,
+		Repo: repo,
+		Work: work,
 	}
 
 	switch o.Source {
 	case "github":
-		a.Kind = jsonString(data["kind"])
+		a.Kind = activityKindFromEvent(jsonString(data["event_type"]), jsonString(data["action"]), data)
 		a.Title = jsonString(data["title"])
 		a.URL = jsonString(data["url"])
 		a.Details = jsonString(data["details"])
 		a.Number = jsonInt(data["number"])
 		a.IsAuthor = jsonBool(data["is_author"])
+
+		// PR merge detection: check live state for review events.
+		if a.Kind == "pr_reviewed" && a.Number > 0 {
+			info := fetchPRInfo(repo, a.Number, prCache)
+			if info != nil {
+				if a.Title == "" {
+					a.Title = info.Title
+				}
+				if info.Merged {
+					a.Kind = "pr_review_merged"
+				}
+			}
+		}
+		// Fill missing titles for other PR/issue events.
+		if a.Number > 0 && a.Title == "" {
+			if info := fetchPRInfo(repo, a.Number, prCache); info != nil {
+				a.Title = info.Title
+			}
+		}
+
+		// For push events, build details from raw ref and commits.
+		if a.Kind == "pushed" {
+			ref := jsonString(data["ref"])
+			// Skip pushes to default branches — merge side-effects.
+			if ref == "main" || ref == "master" {
+				return nil
+			}
+			var commits []string
+			if raw, ok := data["commits"]; ok {
+				json.Unmarshal(raw, &commits)
+			}
+			if len(commits) == 0 {
+				a.Details = fmt.Sprintf("pushed to %s", ref)
+			} else if len(commits) == 1 {
+				a.Details = fmt.Sprintf("pushed to %s: %s", ref, commits[0])
+			} else {
+				a.Details = fmt.Sprintf("pushed %d commits to %s", len(commits), ref)
+			}
+		}
+
+		// Skip branch deletes — noise in standup context.
+		if a.Kind == "branch_deleted" {
+			return nil
+		}
+
+		// For create events, set details from ref.
+		if a.Kind == "branch_created" || a.Kind == "tag_created" {
+			a.Details = jsonString(data["ref"])
+		}
 
 	case "git":
 		a.Kind = "commit"
@@ -229,6 +315,74 @@ func observationToActivity(o Observation) *Activity {
 	}
 
 	return &a
+}
+
+// resolveRepo applies fork resolution and work classification to a raw repo slug.
+// For GitHub events, uses the GitHub API to check fork parents.
+// For git/session observations, uses local repo remotes.
+func resolveRepo(rawRepo, source, user string, cfg *Config, forkCache map[string]string) (string, bool) {
+	switch source {
+	case "github":
+		return resolveGitHubRepo(rawRepo, user, cfg, forkCache)
+	case "git", "session":
+		// For local sources, check if the repo slug is already resolved
+		// (origin remote), then check if it's a fork via the GitHub API.
+		if cfg.isWorkRepo(rawRepo) {
+			return resolveGitHubRepo(rawRepo, user, cfg, forkCache)
+		}
+		// For user repos, check fork parent.
+		owner, _, ok := strings.Cut(rawRepo, "/")
+		if ok && strings.EqualFold(owner, user) {
+			return resolveGitHubRepo(rawRepo, user, cfg, forkCache)
+		}
+		return rawRepo, false
+	}
+	return rawRepo, false
+}
+
+// activityKindFromEvent derives the Activity kind from raw GitHub event type and action.
+func activityKindFromEvent(eventType, action string, data map[string]json.RawMessage) string {
+	switch eventType {
+	case "PullRequestEvent":
+		switch action {
+		case "opened":
+			return "pr_opened"
+		case "closed":
+			if jsonBool(data["merged"]) {
+				return "pr_merged"
+			}
+			return "pr_closed"
+		case "reopened":
+			return "pr_reopened"
+		}
+	case "PullRequestReviewEvent":
+		return "pr_reviewed"
+	case "IssueCommentEvent":
+		if jsonBool(data["is_pull_request"]) {
+			return "pr_commented"
+		}
+		return "issue_commented"
+	case "IssuesEvent":
+		switch action {
+		case "opened":
+			return "issue_opened"
+		case "closed":
+			return "issue_closed"
+		case "reopened":
+			return "issue_reopened"
+		}
+	case "PushEvent":
+		return "pushed"
+	case "CreateEvent":
+		refType := jsonString(data["ref_type"])
+		if refType == "tag" {
+			return "tag_created"
+		}
+		return "branch_created"
+	case "DeleteEvent":
+		return "branch_deleted"
+	}
+	return eventType
 }
 
 func jsonString(raw json.RawMessage) string {

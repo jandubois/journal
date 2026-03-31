@@ -10,25 +10,23 @@ import (
 	"time"
 )
 
-// scanGitRepos scans all git repos under dir for recent commits by the configured author.
-func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
+// scanGitRepos scans all git repos under dir for recent commits and stores raw observations.
+func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", dir, err)
+		return fmt.Errorf("read %s: %w", dir, err)
 	}
 
 	author := cfg.authorName()
 	if author == "" {
-		// Fall back to global git config.
 		out, err := runCommand("git", "config", "--global", "user.name")
 		if err != nil {
-			return nil, fmt.Errorf("no author name configured")
+			return fmt.Errorf("no author name configured")
 		}
 		author = strings.TrimSpace(out)
 	}
 
 	sinceStr := since.Format("2006-01-02T15:04:05")
-	var activities []Activity
 
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -40,21 +38,20 @@ func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) ([]Activ
 			continue
 		}
 
-		acts, err := scanOneRepo(repoPath, author, sinceStr, cfg)
-		if err != nil {
-			continue
-		}
-		activities = append(activities, acts...)
-
-		if db != nil {
-			storeGitObservations(db, acts)
+		obs := scanOneRepo(repoPath, author, sinceStr)
+		if len(obs) > 0 {
+			if err := insertObservations(db, obs); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: store git observations for %s: %v\n", entry.Name(), err)
+			}
 		}
 	}
 
-	return activities, nil
+	return nil
 }
 
-func scanOneRepo(repoPath, author, since string, cfg *Config) ([]Activity, error) {
+// scanOneRepo scans a single git repo and returns raw observations.
+// Uses the origin remote slug (no upstream/fork resolution).
+func scanOneRepo(repoPath, author, since string) []Observation {
 	out, err := runCommand("git", "-C", repoPath, "log",
 		"--author="+author,
 		"--since="+since,
@@ -63,17 +60,17 @@ func scanOneRepo(repoPath, author, since string, cfg *Config) ([]Activity, error
 		"--format=%H|%aI|%s",
 	)
 	if err != nil {
-		return nil, err
+		return nil
 	}
 	out = strings.TrimSpace(out)
 	if out == "" {
-		return nil, nil
+		return nil
 	}
 
-	repo := repoSlug(repoPath, cfg)
-	work := isWorkDir(repoPath, cfg)
+	// Use origin slug (raw, no upstream preference).
+	repo := originSlug(repoPath)
 
-	var activities []Activity
+	var observations []Observation
 	for _, line := range strings.Split(out, "\n") {
 		parts := strings.SplitN(line, "|", 3)
 		if len(parts) < 3 {
@@ -83,33 +80,28 @@ func scanOneRepo(repoPath, author, since string, cfg *Config) ([]Activity, error
 		if err != nil {
 			continue
 		}
-		activities = append(activities, Activity{
+		data, err := json.Marshal(map[string]any{
+			"hash":    parts[0],
+			"message": parts[2],
+		})
+		if err != nil {
+			continue
+		}
+		observations = append(observations, Observation{
+			Source:   "git",
+			SourceID: parts[0], // commit hash
 			Time:     t,
-			Kind:     "commit",
 			Repo:     repo,
-			URL:      parts[0], // commit hash, used as source ID for observations
-			Details:  parts[2],
-			IsAuthor: true,
-			Work:     work,
+			Data:     data,
 		})
 	}
 
-	return activities, nil
+	return observations
 }
 
-// repoSlug derives a repo slug from a local path.
-// For forks, prefer the upstream remote to group with the parent repo.
-// Otherwise, use origin. Falls back to the directory name.
-func repoSlug(repoPath string, cfg *Config) string {
-	// Check upstream remote first — for forks this points to the parent repo.
-	out, err := runCommand("git", "-C", repoPath, "remote", "get-url", "upstream")
-	if err == nil {
-		if slug := slugFromURL(strings.TrimSpace(out)); slug != "" && cfg.isWorkRepo(slug) {
-			return slug
-		}
-	}
-
-	out, err = runCommand("git", "-C", repoPath, "remote", "get-url", "origin")
+// originSlug returns the repo slug from the origin remote (no fork resolution).
+func originSlug(repoPath string) string {
+	out, err := runCommand("git", "-C", repoPath, "remote", "get-url", "origin")
 	if err == nil {
 		if slug := slugFromURL(strings.TrimSpace(out)); slug != "" {
 			return slug
@@ -137,51 +129,3 @@ func slugFromURL(url string) string {
 	return ""
 }
 
-// isWorkDir checks if a local repo is work-related by examining its remote URLs
-// and per-repo email configuration.
-func isWorkDir(repoPath string, cfg *Config) bool {
-	// Check remote URLs.
-	out, _ := runCommand("git", "-C", repoPath, "remote", "--verbose")
-	for _, line := range strings.Split(out, "\n") {
-		for _, org := range cfg.WorkOrgs {
-			if strings.Contains(line, "github.com/"+org+"/") ||
-				strings.Contains(line, "github.com:"+org+"/") {
-				return true
-			}
-		}
-	}
-
-	// Check per-repo user.email.
-	email, err := runCommand("git", "-C", repoPath, "config", "user.email")
-	if err == nil && cfg.isWorkEmail(strings.TrimSpace(email)) {
-		return true
-	}
-
-	return false
-}
-
-func storeGitObservations(db *sql.DB, activities []Activity) {
-	var observations []Observation
-	for _, a := range activities {
-		data, err := json.Marshal(map[string]any{
-			"hash":    a.URL, // commit hash stored in URL field
-			"message": a.Details,
-		})
-		if err != nil {
-			continue
-		}
-		observations = append(observations, Observation{
-			Source:   "git",
-			SourceID: a.URL, // commit hash
-			Time:     a.Time,
-			Repo:     a.Repo,
-			Work:     a.Work,
-			Data:     data,
-		})
-	}
-	if len(observations) > 0 {
-		if err := insertObservations(db, observations); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: store git observations: %v\n", err)
-		}
-	}
-}

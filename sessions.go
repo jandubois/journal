@@ -11,20 +11,19 @@ import (
 	"time"
 )
 
-// scanSessions reads Claude Code session JSONL files and extracts activity metadata.
-func scanSessions(since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) {
+// scanSessions reads Claude Code session JSONL files and stores raw observations.
+func scanSessions(db *sql.DB) error {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	projectsDir := filepath.Join(home, ".claude", "projects")
 
 	entries, err := os.ReadDir(projectsDir)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", projectsDir, err)
+		return fmt.Errorf("read %s: %w", projectsDir, err)
 	}
 
-	var activities []Activity
 	var observations []Observation
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -33,30 +32,28 @@ func scanSessions(since time.Time, cfg *Config, db *sql.DB) ([]Activity, error) 
 		projDir := filepath.Join(projectsDir, entry.Name())
 		projName := projectDirToName(entry.Name())
 
-		acts, obs, err := scanProjectSessions(projDir, projName, since, cfg)
-		if err != nil {
-			continue
-		}
-		activities = append(activities, acts...)
+		obs := scanProjectSessions(projDir, projName)
 		observations = append(observations, obs...)
 	}
 
-	if db != nil && len(observations) > 0 {
+	if len(observations) > 0 {
 		if err := insertObservations(db, observations); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: store session observations: %v\n", err)
+			return fmt.Errorf("store session observations: %w", err)
 		}
 	}
 
-	return activities, nil
+	return nil
 }
 
-func scanProjectSessions(projDir, projName string, since time.Time, cfg *Config) ([]Activity, []Observation, error) {
+func scanProjectSessions(projDir, projName string) []Observation {
 	entries, err := os.ReadDir(projDir)
 	if err != nil {
-		return nil, nil, err
+		return nil
 	}
 
-	var activities []Activity
+	// Use origin slug for the repo field (raw, no fork resolution).
+	repo := projectOriginSlug(projName)
+
 	var observations []Observation
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
@@ -65,43 +62,46 @@ func scanProjectSessions(projDir, projName string, since time.Time, cfg *Config)
 
 		sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
 		path := filepath.Join(projDir, entry.Name())
-		a, prompts, err := parseSessionFile(path, projName, cfg)
-		if err != nil || a == nil {
+		startTime, duration, prompts := parseSessionFile(path)
+		if startTime.IsZero() {
 			continue
 		}
 
-		// Store observation for every session (regardless of since filter).
-		obs := sessionToObservation(sessionID, projDir, a, prompts)
-		if obs != nil {
-			observations = append(observations, *obs)
-		}
-
-		// Only include in current report if within the time range.
-		sessionEnd := a.Time.Add(a.Duration)
-		if sessionEnd.Before(since) {
+		data, err := json.Marshal(map[string]any{
+			"session_id":      sessionID,
+			"project_dir":     filepath.Base(projDir),
+			"project_name":    projName,
+			"duration_seconds": int(duration.Seconds()),
+			"prompts":         prompts,
+		})
+		if err != nil {
 			continue
 		}
 
-		activities = append(activities, *a)
+		observations = append(observations, Observation{
+			Source:   "session",
+			SourceID: sessionID,
+			Time:     startTime,
+			Repo:     repo,
+			Data:     data,
+		})
 	}
 
-	return activities, observations, nil
+	return observations
 }
 
-func parseSessionFile(path, projName string, cfg *Config) (*Activity, []string, error) {
+// parseSessionFile extracts raw metadata from a session JSONL file.
+func parseSessionFile(path string) (startTime time.Time, duration time.Duration, prompts []string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return nil, nil, err
+		return
 	}
 	defer f.Close()
 
-	var firstTime, prevTime time.Time
-	var activeDuration time.Duration
-	var prompts []string
+	var prevTime time.Time
 
 	// Gap threshold: if more than 10 minutes pass between messages,
-	// assume the user was away. This gives a more accurate "active" duration
-	// for sessions that span multiple days or have long idle periods.
+	// assume the user was away.
 	const gapThreshold = 10 * time.Minute
 
 	scanner := bufio.NewScanner(f)
@@ -123,19 +123,18 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, []string, 
 		}
 		t, err := time.Parse(time.RFC3339Nano, msg.Timestamp)
 		if err != nil {
-			// Try millisecond timestamp format.
 			t, err = time.Parse("2006-01-02T15:04:05.000Z", msg.Timestamp)
 			if err != nil {
 				continue
 			}
 		}
 
-		if firstTime.IsZero() {
-			firstTime = t
+		if startTime.IsZero() {
+			startTime = t
 		} else if !prevTime.IsZero() {
 			gap := t.Sub(prevTime)
 			if gap <= gapThreshold {
-				activeDuration += gap
+				duration += gap
 			}
 		}
 		prevTime = t
@@ -148,30 +147,7 @@ func parseSessionFile(path, projName string, cfg *Config) (*Activity, []string, 
 		}
 	}
 
-	if firstTime.IsZero() {
-		return nil, nil, nil
-	}
-
-	// Build a summary from the first prompt.
-	var details string
-	if len(prompts) > 0 {
-		details = prompts[0]
-		if len(details) > 120 {
-			details = details[:120] + "..."
-		}
-	}
-
-	repo := projectNameToRepo(projName, cfg)
-	work := projectIsWork(projName, cfg)
-
-	return &Activity{
-		Time:     firstTime,
-		Duration: activeDuration,
-		Kind:     "session",
-		Repo:     repo,
-		Details:  details,
-		Work:     work,
-	}, prompts, nil
+	return
 }
 
 // extractPromptText pulls the first text block from a message content array.
@@ -273,41 +249,12 @@ func findLocalRepo(projName string) string {
 	return ""
 }
 
-// projectNameToRepo maps a project name to a repo slug.
-func projectNameToRepo(projName string, cfg *Config) string {
+// projectOriginSlug returns the origin remote slug for a project (raw, no fork resolution).
+func projectOriginSlug(projName string) string {
 	if repoPath := findLocalRepo(projName); repoPath != "" {
-		return repoSlug(repoPath, cfg)
+		return originSlug(repoPath)
 	}
 	return projName
-}
-
-// projectIsWork checks if a project is work-related.
-func projectIsWork(projName string, cfg *Config) bool {
-	if repoPath := findLocalRepo(projName); repoPath != "" {
-		return isWorkDir(repoPath, cfg)
-	}
-	// If no local repo, check if the project name matches a work org.
-	return cfg.isWorkRepo(projName)
-}
-
-func sessionToObservation(sessionID, projDir string, a *Activity, prompts []string) *Observation {
-	data, err := json.Marshal(map[string]any{
-		"session_id":       sessionID,
-		"project_dir":      filepath.Base(projDir),
-		"duration_seconds":  int(a.Duration.Seconds()),
-		"prompts":          prompts,
-	})
-	if err != nil {
-		return nil
-	}
-	return &Observation{
-		Source:   "session",
-		SourceID: sessionID,
-		Time:     a.Time,
-		Repo:     a.Repo,
-		Work:     a.Work,
-		Data:     data,
-	}
 }
 
 type sessionMessage struct {
