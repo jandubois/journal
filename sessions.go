@@ -188,6 +188,9 @@ func archiveSessionFile(srcPath, projName, sessionID, archiveDir string) string 
 }
 
 // parseSessionFile extracts raw metadata from a session JSONL file.
+// Returns zero startTime for files with no timestamped messages (e.g. pure
+// file-history snapshots). These are skipped by the caller — they contain
+// no conversation content useful for summarization.
 func parseSessionFile(path string) (startTime time.Time, duration time.Duration, prompts []string) {
 	f, err := os.Open(path)
 	if err != nil {
