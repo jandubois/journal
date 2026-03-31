@@ -1,6 +1,7 @@
 ---
 name: summarize
 description: Generate AI summaries for journal events that lack them. Invoke with /summarize or /summarize 2w.
+argument-hint: [time-range]
 ---
 
 # Summarize journal events
