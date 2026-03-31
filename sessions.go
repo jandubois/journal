@@ -162,17 +162,24 @@ func sessionArchiveDir() string {
 }
 
 // archiveSessionFile copies a session JSONL file to the archive directory.
-// Returns the archive path, or empty string if archiving failed or file already exists.
+// Re-copies if the source is newer or larger than the archive (live sessions grow).
 func archiveSessionFile(srcPath, projName, sessionID, archiveDir string) string {
 	destDir := filepath.Join(archiveDir, projName)
 	destPath := filepath.Join(destDir, sessionID+".jsonl")
 
-	// Skip if already archived.
-	if _, err := os.Stat(destPath); err == nil {
-		return destPath
+	srcInfo, err := os.Stat(srcPath)
+	if err != nil {
+		return ""
 	}
 
-	if err := os.MkdirAll(destDir, 0o755); err != nil {
+	// Skip if archive exists and is at least as large as the source.
+	if destInfo, err := os.Stat(destPath); err == nil {
+		if destInfo.Size() >= srcInfo.Size() {
+			return destPath
+		}
+	}
+
+	if err := os.MkdirAll(destDir, 0o700); err != nil {
 		return ""
 	}
 
@@ -180,7 +187,7 @@ func archiveSessionFile(srcPath, projName, sessionID, archiveDir string) string 
 	if err != nil {
 		return ""
 	}
-	if err := os.WriteFile(destPath, src, 0o644); err != nil {
+	if err := os.WriteFile(destPath, src, 0o600); err != nil {
 		return ""
 	}
 
@@ -245,6 +252,10 @@ func parseSessionFile(path string) (startTime time.Time, duration time.Duration,
 				prompts = append(prompts, prompt)
 			}
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: incomplete session parse %s: %v\n", path, err)
 	}
 
 	return

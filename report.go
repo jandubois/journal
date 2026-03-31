@@ -384,5 +384,8 @@ func kindLabel(kind string) string {
 	if l, ok := labels[kind]; ok {
 		return l
 	}
-	return strings.Title(kind)
+	if len(kind) == 0 {
+		return kind
+	}
+	return strings.ToUpper(kind[:1]) + kind[1:]
 }

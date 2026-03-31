@@ -68,7 +68,7 @@ type Observation struct {
 
 func openDB() (*sql.DB, error) {
 	dbPath := dbFilePath()
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
 
@@ -92,15 +92,17 @@ func openDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("create schema: %w", err)
 	}
 
-	// Set schema version.
-	db.Exec("DELETE FROM schema_version")
-	db.Exec("INSERT INTO schema_version (version) VALUES (?)", schemaVersion)
+	// Set schema version within a transaction.
+	if _, err := db.Exec("BEGIN; DELETE FROM schema_version; INSERT INTO schema_version (version) VALUES (?); COMMIT;", schemaVersion); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set schema version: %w", err)
+	}
 
 	return db, nil
 }
 
 func needsReset(dbPath string) bool {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=foreign_keys(on)")
 	if err != nil {
 		return true
 	}
@@ -292,7 +294,6 @@ func observationToActivity(o Observation, cfg *Config, user string, forkCache ma
 
 	case "git":
 		a.Kind = "commit"
-		a.URL = jsonString(data["hash"]) // commit hash stored in URL
 		a.Details = jsonString(data["message"])
 		a.IsAuthor = true
 

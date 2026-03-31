@@ -100,7 +100,7 @@ func defaultReposDir() string {
 func parseSince(s string) (time.Time, error) {
 	now := time.Now()
 
-	if t, err := time.Parse("2006-01-02", s); err == nil {
+	if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
 		return t, nil
 	}
 
