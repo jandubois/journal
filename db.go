@@ -156,16 +156,97 @@ func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	var observations []Observation
 	for rows.Next() {
 		var o Observation
-		var ts string
+		var ts, dataStr string
 		var work int
-		if err := rows.Scan(&o.Source, &o.SourceID, &ts, &o.Repo, &work, &o.Data); err != nil {
+		if err := rows.Scan(&o.Source, &o.SourceID, &ts, &o.Repo, &work, &dataStr); err != nil {
 			return nil, err
 		}
 		o.Time, _ = time.Parse(time.RFC3339Nano, ts)
 		o.Work = work != 0
+		o.Data = json.RawMessage(dataStr)
 		observations = append(observations, o)
 	}
 	return observations, rows.Err()
+}
+
+// observationsToActivities reconstructs Activity structs from database observations.
+func observationsToActivities(observations []Observation) []Activity {
+	var activities []Activity
+	for _, o := range observations {
+		a := observationToActivity(o)
+		if a != nil {
+			activities = append(activities, *a)
+		}
+	}
+	return activities
+}
+
+func observationToActivity(o Observation) *Activity {
+	var data map[string]json.RawMessage
+	if err := json.Unmarshal(o.Data, &data); err != nil {
+		return nil
+	}
+
+	a := Activity{
+		Time: o.Time,
+		Repo: o.Repo,
+		Work: o.Work,
+	}
+
+	switch o.Source {
+	case "github":
+		a.Kind = jsonString(data["kind"])
+		a.Title = jsonString(data["title"])
+		a.URL = jsonString(data["url"])
+		a.Details = jsonString(data["details"])
+		a.Number = jsonInt(data["number"])
+		a.IsAuthor = jsonBool(data["is_author"])
+
+	case "git":
+		a.Kind = "commit"
+		a.URL = jsonString(data["hash"]) // commit hash stored in URL
+		a.Details = jsonString(data["message"])
+		a.IsAuthor = true
+
+	case "session":
+		a.Kind = "session"
+		a.Duration = time.Duration(jsonInt(data["duration_seconds"])) * time.Second
+		// Use first prompt as details.
+		var prompts []string
+		if raw, ok := data["prompts"]; ok {
+			json.Unmarshal(raw, &prompts)
+		}
+		if len(prompts) > 0 {
+			details := prompts[0]
+			if len(details) > 120 {
+				details = details[:120] + "..."
+			}
+			a.Details = details
+		}
+
+	default:
+		return nil
+	}
+
+	return &a
+}
+
+func jsonString(raw json.RawMessage) string {
+	var s string
+	json.Unmarshal(raw, &s)
+	return s
+}
+
+func jsonInt(raw json.RawMessage) int {
+	var n int
+	json.Unmarshal(raw, &n)
+	return n
+}
+
+func jsonBool(raw json.RawMessage) bool {
+	var b bool
+	json.Unmarshal(raw, &b)
+	return b
 }
 
 func boolToInt(b bool) int {

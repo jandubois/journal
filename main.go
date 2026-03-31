@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"flag"
 	"fmt"
 	"os"
@@ -38,31 +39,21 @@ func main() {
 
 	db, err := openDB()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not open database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: could not open database: %v\n", err)
+		os.Exit(1)
 	}
-	if db != nil {
-		defer db.Close()
-	}
+	defer db.Close()
 
-	var activities []Activity
+	// Collect: fetch latest data from all sources into the database.
+	collect(*user, *repos, cfg, db)
 
-	ghActivities, err := fetchGitHubEvents(*user, cutoff, cfg, db)
+	// Report: query the database for the requested time range.
+	observations, err := queryObservations(db, cutoff)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: GitHub events: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: query observations: %v\n", err)
+		os.Exit(1)
 	}
-	activities = append(activities, ghActivities...)
-
-	gitActivities, err := scanGitRepos(*repos, cutoff, cfg, db)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: git repos: %v\n", err)
-	}
-	activities = append(activities, gitActivities...)
-
-	sessionActivities, err := scanSessions(cutoff, cfg, db)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: Claude sessions: %v\n", err)
-	}
-	activities = append(activities, sessionActivities...)
+	activities := observationsToActivities(observations)
 
 	topics := groupActivities(activities)
 	inferNextSteps(topics)
@@ -75,6 +66,26 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "unknown format %q\n", *format)
 		os.Exit(1)
+	}
+}
+
+// collect fetches latest data from all sources and writes observations to the database.
+// It fetches broadly (not limited to the --since range) to capture as much as possible.
+func collect(user, reposDir string, cfg *Config, db *sql.DB) {
+	// GitHub: fetch all available events (API returns up to 90 days / 300 events).
+	if _, err := fetchGitHubEvents(user, time.Time{}, cfg, db); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: GitHub events: %v\n", err)
+	}
+
+	// Git: scan for recent commits (last 90 days to match GitHub range).
+	gitCutoff := time.Now().AddDate(0, -3, 0)
+	if _, err := scanGitRepos(reposDir, gitCutoff, cfg, db); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: git repos: %v\n", err)
+	}
+
+	// Sessions: scan all available session files.
+	if _, err := scanSessions(time.Time{}, cfg, db); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: Claude sessions: %v\n", err)
 	}
 }
 
