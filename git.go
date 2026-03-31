@@ -17,13 +17,9 @@ func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) error {
 		return fmt.Errorf("read %s: %w", dir, err)
 	}
 
-	author := cfg.authorName()
-	if author == "" {
-		out, err := runCommand("git", "config", "--global", "user.name")
-		if err != nil {
-			return fmt.Errorf("no author name configured")
-		}
-		author = strings.TrimSpace(out)
+	authors := authorIdentities(cfg)
+	if len(authors) == 0 {
+		return fmt.Errorf("no author identity configured")
 	}
 
 	sinceStr := since.Format("2006-01-02T15:04:05")
@@ -38,7 +34,7 @@ func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) error {
 			continue
 		}
 
-		obs := scanOneRepo(repoPath, author, sinceStr)
+		obs := scanOneRepo(repoPath, authors, sinceStr)
 		if len(obs) > 0 {
 			if err := insertObservations(db, obs); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: store git observations for %s: %v\n", entry.Name(), err)
@@ -49,51 +45,84 @@ func scanGitRepos(dir string, since time.Time, cfg *Config, db *sql.DB) error {
 	return nil
 }
 
-// scanOneRepo scans a single git repo and returns raw observations.
-// Uses the origin remote slug (no upstream/fork resolution).
-func scanOneRepo(repoPath, author, since string) []Observation {
-	out, err := runCommand("git", "-C", repoPath, "log",
-		"--author="+author,
-		"--since="+since,
-		"--all",
-		"--no-merges",
-		"--format=%H|%aI|%s",
-	)
-	if err != nil {
-		return nil
-	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		return nil
+// authorIdentities returns all name and email strings to match commits against.
+func authorIdentities(cfg *Config) []string {
+	seen := make(map[string]bool)
+	var authors []string
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s != "" && !seen[s] {
+			seen[s] = true
+			authors = append(authors, s)
+		}
 	}
 
-	// Use origin slug (raw, no upstream preference).
+	add(cfg.authorName())
+	add(cfg.Identity.WorkEmail)
+	add(cfg.Identity.PersonalEmail)
+
+	// Fall back to global git config.
+	if len(authors) == 0 {
+		if out, err := runCommand("git", "config", "--global", "user.name"); err == nil {
+			add(strings.TrimSpace(out))
+		}
+		if out, err := runCommand("git", "config", "--global", "user.email"); err == nil {
+			add(strings.TrimSpace(out))
+		}
+	}
+
+	return authors
+}
+
+// scanOneRepo scans a single git repo and returns raw observations.
+// Searches for commits matching any of the given author identities (name or email).
+func scanOneRepo(repoPath string, authors []string, since string) []Observation {
 	repo := originSlug(repoPath)
+	seen := make(map[string]bool) // deduplicate by commit hash
 
 	var observations []Observation
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) < 3 {
+	for _, author := range authors {
+		out, err := runCommand("git", "-C", repoPath, "log",
+			"--author="+author,
+			"--since="+since,
+			"--all",
+			"--no-merges",
+			"--format=%H|%aI|%s",
+		)
+		if err != nil || strings.TrimSpace(out) == "" {
 			continue
 		}
-		t, err := time.Parse(time.RFC3339, parts[1])
-		if err != nil {
-			continue
+
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			parts := strings.SplitN(line, "|", 3)
+			if len(parts) < 3 {
+				continue
+			}
+			hash := parts[0]
+			if seen[hash] {
+				continue
+			}
+			seen[hash] = true
+
+			t, err := time.Parse(time.RFC3339, parts[1])
+			if err != nil {
+				continue
+			}
+			data, err := json.Marshal(map[string]any{
+				"hash":    hash,
+				"message": parts[2],
+			})
+			if err != nil {
+				continue
+			}
+			observations = append(observations, Observation{
+				Source:   "git",
+				SourceID: hash,
+				Time:     t,
+				Repo:     repo,
+				Data:     data,
+			})
 		}
-		data, err := json.Marshal(map[string]any{
-			"hash":    parts[0],
-			"message": parts[2],
-		})
-		if err != nil {
-			continue
-		}
-		observations = append(observations, Observation{
-			Source:   "git",
-			SourceID: parts[0], // commit hash
-			Time:     t,
-			Repo:     repo,
-			Data:     data,
-		})
 	}
 
 	return observations
