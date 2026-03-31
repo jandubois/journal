@@ -202,6 +202,50 @@ func queryObservations(db *sql.DB, since time.Time) ([]Observation, error) {
 	return observations, rows.Err()
 }
 
+// queryTopicHistory fetches all observations for specific (repo, number) pairs,
+// regardless of time range. This provides full history for next-step inference
+// on topics that started before the --since window.
+func queryTopicHistory(db *sql.DB, repoNumbers [][2]string) ([]Observation, error) {
+	if len(repoNumbers) == 0 {
+		return nil, nil
+	}
+
+	// Build a query with OR clauses for each (repo, number) pair.
+	// We match on the raw repo slug in the observation, so we need to check
+	// all repo slugs that might resolve to the same canonical repo.
+	query := `SELECT id, source, source_id, timestamp, repo, data
+		 FROM observations
+		 WHERE source = 'github' AND (`
+	args := make([]any, 0, len(repoNumbers)*2)
+	for i, rn := range repoNumbers {
+		if i > 0 {
+			query += " OR "
+		}
+		query += "(repo = ? AND json_extract(data, '$.number') = ?)"
+		args = append(args, rn[0], rn[1])
+	}
+	query += ") ORDER BY timestamp"
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var observations []Observation
+	for rows.Next() {
+		var o Observation
+		var ts, dataStr string
+		if err := rows.Scan(&o.ID, &o.Source, &o.SourceID, &ts, &o.Repo, &dataStr); err != nil {
+			return nil, err
+		}
+		o.Time, _ = time.Parse(time.RFC3339Nano, ts)
+		o.Data = json.RawMessage(dataStr)
+		observations = append(observations, o)
+	}
+	return observations, rows.Err()
+}
+
 // observationsToActivities reconstructs Activity structs from database observations,
 // applying all interpretation: fork resolution, work classification, PR merge detection.
 func observationsToActivities(observations []Observation, cfg *Config, user string) []Activity {

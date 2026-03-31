@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -55,6 +56,10 @@ func main() {
 	}
 	activities := observationsToActivities(observations, cfg, *user)
 	topics := groupActivities(activities)
+
+	// Load full history for numbered topics so next-step inference
+	// sees the complete picture (e.g. a PR opened last week but reviewed today).
+	enrichTopicsWithHistory(db, topics, cfg, *user)
 	inferNextSteps(topics)
 
 	if err := processEvents(db, topics); err != nil {
@@ -74,6 +79,86 @@ func main() {
 
 // collect fetches latest data from all sources and writes observations to the database.
 // It fetches broadly (not limited to the --since range) to capture as much as possible.
+// enrichTopicsWithHistory loads full observation history for numbered topics
+// (PRs, issues) so that next-step inference sees events from before the --since
+// window. Without this, a PR opened last week but reviewed today would appear
+// as if the user is only a reviewer, yielding wrong next steps.
+func enrichTopicsWithHistory(db *sql.DB, topics []*Topic, cfg *Config, user string) {
+	// Collect (raw repo slug, number) pairs for topics that have PR/issue numbers.
+	// We need the raw repo slug (before fork resolution) to match observations.
+	var repoNumbers [][2]string
+	seen := make(map[string]bool)
+	for _, t := range topics {
+		if t.Number == 0 {
+			continue
+		}
+		// Query with the resolved repo — observations may use different raw slugs,
+		// but the number within each repo is what matters for grouping.
+		for _, a := range t.Activities {
+			// Use the raw observation repo (before resolution) for the query.
+			// We need to look it up from the observation's source data.
+			key := fmt.Sprintf("%s#%d", t.Repo, t.Number)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			repoNumbers = append(repoNumbers, [2]string{a.Repo, fmt.Sprintf("%d", t.Number)})
+			break
+		}
+	}
+
+	if len(repoNumbers) == 0 {
+		return
+	}
+
+	// Also query with raw (pre-fork-resolution) repo slugs from the observations.
+	var rawRepoNumbers [][2]string
+	for _, rn := range repoNumbers {
+		rawRepoNumbers = append(rawRepoNumbers, rn)
+	}
+	// Query observations that share the same numbers across related repos.
+	histObs, err := queryTopicHistory(db, rawRepoNumbers)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: load topic history: %v\n", err)
+		return
+	}
+	if len(histObs) == 0 {
+		return
+	}
+
+	histActivities := observationsToActivities(histObs, cfg, user)
+
+	// Merge historical activities into existing topics.
+	existingIDs := make(map[int64]bool)
+	for _, t := range topics {
+		for _, a := range t.Activities {
+			existingIDs[a.ObservationID] = true
+		}
+	}
+
+	topicMap := make(map[string]*Topic)
+	for _, t := range topics {
+		topicMap[topicKey(Activity{Repo: t.Repo, Number: t.Number})] = t
+	}
+
+	for _, a := range histActivities {
+		if existingIDs[a.ObservationID] {
+			continue
+		}
+		key := topicKey(a)
+		if t, ok := topicMap[key]; ok {
+			t.Activities = append(t.Activities, a)
+		}
+	}
+
+	// Re-sort activities within enriched topics.
+	for _, t := range topics {
+		sort.Slice(t.Activities, func(i, j int) bool {
+			return t.Activities[i].Time.Before(t.Activities[j].Time)
+		})
+	}
+}
+
 func collect(user, reposDir string, cfg *Config, db *sql.DB) {
 	if err := fetchGitHubEvents(user, db); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: GitHub events: %v\n", err)
