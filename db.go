@@ -297,13 +297,16 @@ func observationToActivity(o Observation, cfg *Config, user string, forkCache ma
 	case "session":
 		a.Kind = "session"
 		a.Duration = time.Duration(jsonInt(data["duration_seconds"])) * time.Second
-		// Use first prompt as details.
+		// Use first line of first prompt as display summary.
 		var prompts []string
 		if raw, ok := data["prompts"]; ok {
 			json.Unmarshal(raw, &prompts)
 		}
 		if len(prompts) > 0 {
 			details := prompts[0]
+			if idx := strings.IndexByte(details, '\n'); idx > 0 {
+				details = details[:idx]
+			}
 			if len(details) > 120 {
 				details = details[:120] + "..."
 			}

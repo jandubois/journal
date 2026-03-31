@@ -51,8 +51,8 @@ func scanProjectSessions(projDir, projName string) []Observation {
 		return nil
 	}
 
-	// Use origin slug for the repo field (raw, no fork resolution).
 	repo := projectOriginSlug(projName)
+	archiveDir := sessionArchiveDir()
 
 	var observations []Observation
 	for _, entry := range entries {
@@ -61,18 +61,22 @@ func scanProjectSessions(projDir, projName string) []Observation {
 		}
 
 		sessionID := strings.TrimSuffix(entry.Name(), ".jsonl")
-		path := filepath.Join(projDir, entry.Name())
-		startTime, duration, prompts := parseSessionFile(path)
+		srcPath := filepath.Join(projDir, entry.Name())
+		startTime, duration, prompts := parseSessionFile(srcPath)
 		if startTime.IsZero() {
 			continue
 		}
 
+		// Archive the session file for future AI summarization.
+		archivePath := archiveSessionFile(srcPath, projName, sessionID, archiveDir)
+
 		data, err := json.Marshal(map[string]any{
-			"session_id":      sessionID,
-			"project_dir":     filepath.Base(projDir),
-			"project_name":    projName,
-			"duration_seconds": int(duration.Seconds()),
-			"prompts":         prompts,
+			"session_id":       sessionID,
+			"project_dir":      filepath.Base(projDir),
+			"project_name":     projName,
+			"duration_seconds":  int(duration.Seconds()),
+			"prompts":          prompts,
+			"archive_path":     archivePath,
 		})
 		if err != nil {
 			continue
@@ -88,6 +92,41 @@ func scanProjectSessions(projDir, projName string) []Observation {
 	}
 
 	return observations
+}
+
+func sessionArchiveDir() string {
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		home, _ := os.UserHomeDir()
+		dataDir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dataDir, "journal", "sessions")
+}
+
+// archiveSessionFile copies a session JSONL file to the archive directory.
+// Returns the archive path, or empty string if archiving failed or file already exists.
+func archiveSessionFile(srcPath, projName, sessionID, archiveDir string) string {
+	destDir := filepath.Join(archiveDir, projName)
+	destPath := filepath.Join(destDir, sessionID+".jsonl")
+
+	// Skip if already archived.
+	if _, err := os.Stat(destPath); err == nil {
+		return destPath
+	}
+
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return ""
+	}
+
+	src, err := os.ReadFile(srcPath)
+	if err != nil {
+		return ""
+	}
+	if err := os.WriteFile(destPath, src, 0o644); err != nil {
+		return ""
+	}
+
+	return destPath
 }
 
 // parseSessionFile extracts raw metadata from a session JSONL file.
@@ -150,9 +189,8 @@ func parseSessionFile(path string) (startTime time.Time, duration time.Duration,
 	return
 }
 
-// extractPromptText pulls the first text block from a message content array.
+// extractPromptText pulls the full text from a message content array.
 func extractPromptText(raw json.RawMessage) string {
-	// The message field has {"role": "user", "content": [{"type": "text", "text": "..."}]}
 	var msg struct {
 		Content []struct {
 			Type string `json:"type"`
@@ -164,12 +202,7 @@ func extractPromptText(raw json.RawMessage) string {
 	}
 	for _, block := range msg.Content {
 		if block.Type == "text" && block.Text != "" {
-			text := block.Text
-			// Take just the first line.
-			if idx := strings.IndexByte(text, '\n'); idx > 0 {
-				text = text[:idx]
-			}
-			return strings.TrimSpace(text)
+			return strings.TrimSpace(block.Text)
 		}
 	}
 	return ""
