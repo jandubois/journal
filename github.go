@@ -38,7 +38,7 @@ func fetchGitHubEvents(user string, since time.Time, cfg *Config) ([]Activity, e
 	}
 
 	var activities []Activity
-	titleCache := make(map[string]string) // "owner/repo#123" -> title
+	infoCache := make(map[string]*prInfo) // "owner/repo#123" -> info
 	forkCache := make(map[string]string)  // "owner/repo" -> parent slug or ""
 
 	for _, e := range allEvents {
@@ -47,9 +47,19 @@ func fetchGitHubEvents(user string, since time.Time, cfg *Config) ([]Activity, e
 		}
 		acts := convertEvent(e, cfg, user, forkCache)
 		for i := range acts {
-			// Fetch missing titles.
-			if acts[i].Number > 0 && acts[i].Title == "" {
-				acts[i].Title = fetchTitle(acts[i].Repo, acts[i].Number, titleCache)
+			if acts[i].Number == 0 {
+				continue
+			}
+			info := fetchPRInfo(acts[i].Repo, acts[i].Number, infoCache)
+			if info == nil {
+				continue
+			}
+			if acts[i].Title == "" {
+				acts[i].Title = info.Title
+			}
+			// If we reviewed a PR and it's now merged, record the merge.
+			if acts[i].Kind == "pr_reviewed" && info.Merged {
+				acts[i].Kind = "pr_review_merged"
 			}
 		}
 		activities = append(activities, acts...)
@@ -190,29 +200,52 @@ func convertEvent(e ghEvent, cfg *Config, user string, forkCache map[string]stri
 	return nil
 }
 
-func fetchTitle(repo string, number int, cache map[string]string) string {
+type prInfo struct {
+	Title  string
+	State  string // "open", "closed"
+	Merged bool
+}
+
+func fetchPRInfo(repo string, number int, cache map[string]*prInfo) *prInfo {
 	key := fmt.Sprintf("%s#%d", repo, number)
-	if title, ok := cache[key]; ok {
-		return title
+	if info, ok := cache[key]; ok {
+		return info
 	}
 
-	// Try as PR first, fall back to issue.
+	// Try as PR first (returns title, state, and merged status).
 	out, err := runCommand("gh", "api",
 		fmt.Sprintf("/repos/%s/pulls/%d", repo, number),
-		"--jq", ".title",
+		"--jq", "[.title, .state, (if .merged then \"merged\" else \"\" end)] | join(\"|\")",
 	)
-	if err != nil {
-		out, err = runCommand("gh", "api",
-			fmt.Sprintf("/repos/%s/issues/%d", repo, number),
-			"--jq", ".title",
-		)
+	if err == nil {
+		parts := strings.SplitN(strings.TrimSpace(out), "|", 3)
+		if len(parts) == 3 {
+			info := &prInfo{
+				Title:  parts[0],
+				State:  parts[1],
+				Merged: parts[2] == "merged",
+			}
+			cache[key] = info
+			return info
+		}
 	}
-	title := strings.TrimSpace(out)
-	if err != nil {
-		title = ""
+
+	// Fall back to issue (no merged state).
+	out, err = runCommand("gh", "api",
+		fmt.Sprintf("/repos/%s/issues/%d", repo, number),
+		"--jq", "[.title, .state] | join(\"|\")",
+	)
+	if err == nil {
+		parts := strings.SplitN(strings.TrimSpace(out), "|", 2)
+		if len(parts) == 2 {
+			info := &prInfo{Title: parts[0], State: parts[1]}
+			cache[key] = info
+			return info
+		}
 	}
-	cache[key] = title
-	return title
+
+	cache[key] = nil
+	return nil
 }
 
 // resolveGitHubRepo maps a repo slug to its canonical name and work classification.

@@ -17,7 +17,7 @@ func inferNextStep(t *Topic) string {
 	// Closed/merged items are done.
 	for _, a := range t.Activities {
 		switch a.Kind {
-		case "pr_merged", "pr_closed", "issue_closed":
+		case "pr_merged", "pr_closed", "issue_closed", "pr_review_merged":
 			return "Done"
 		}
 	}
@@ -35,7 +35,7 @@ func isPRTopic(t *Topic) bool {
 	for _, a := range t.Activities {
 		switch a.Kind {
 		case "pr_opened", "pr_merged", "pr_closed", "pr_reopened",
-			"pr_reviewed", "pr_commented":
+			"pr_reviewed", "pr_review_merged", "pr_commented":
 			return true
 		}
 	}

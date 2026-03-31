@@ -82,6 +82,18 @@ func renderTextTopic(w io.Writer, t *Topic) {
 	if isPRTopic(t) {
 		prefix = "PR #"
 	}
+
+	// Compact rendering for done topics: one line per topic.
+	if t.NextStep == "Done" {
+		action := summarizeActions(t)
+		if t.Title != "" {
+			fmt.Fprintf(w, "%s%d: %s — %s\n", prefix, t.Number, t.Title, action)
+		} else {
+			fmt.Fprintf(w, "%s%d — %s\n", prefix, t.Number, action)
+		}
+		return
+	}
+
 	if t.Title != "" {
 		fmt.Fprintf(w, "%s%d: %s\n", prefix, t.Number, t.Title)
 	} else {
@@ -228,6 +240,18 @@ func renderMarkdownTopic(w io.Writer, t *Topic) {
 	if t.URL != "" {
 		ref = fmt.Sprintf("[%s#%d](%s)", prefix, t.Number, t.URL)
 	}
+
+	// Compact rendering for done topics.
+	if t.NextStep == "Done" {
+		action := summarizeActions(t)
+		if t.Title != "" {
+			fmt.Fprintf(w, "%s: %s — %s\n", ref, t.Title, action)
+		} else {
+			fmt.Fprintf(w, "%s — %s\n", ref, action)
+		}
+		return
+	}
+
 	if t.Title != "" {
 		fmt.Fprintf(w, "%s: %s\n", ref, t.Title)
 	} else {
@@ -267,6 +291,8 @@ func activityDescription(a Activity) string {
 		return "Reopened PR"
 	case "pr_reviewed":
 		return fmt.Sprintf("Reviewed (%s)", a.Details)
+	case "pr_review_merged":
+		return "Reviewed and merged"
 	case "pr_commented":
 		return "Commented on PR"
 	case "issue_opened":
@@ -290,6 +316,26 @@ func activityDescription(a Activity) string {
 	default:
 		return a.Kind
 	}
+}
+
+// summarizeActions produces a short description of what happened in a topic.
+func summarizeActions(t *Topic) string {
+	var parts []string
+	seen := make(map[string]bool)
+	for _, a := range t.Activities {
+		if a.Kind == "session" {
+			continue
+		}
+		desc := activityDescription(a)
+		if !seen[desc] {
+			seen[desc] = true
+			parts = append(parts, desc)
+		}
+	}
+	if len(parts) == 0 {
+		return "Done"
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatDuration(d time.Duration) string {
