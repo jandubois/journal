@@ -226,7 +226,7 @@ func renderMarkdownSection(w io.Writer, topics []*Topic) {
 		}
 
 		for _, t := range repoLevel {
-			renderTextRepoLevel(w, t) // Reuse text format for repo-level.
+			renderMarkdownRepoLevel(w, t)
 		}
 	}
 }
@@ -275,6 +275,41 @@ func renderMarkdownTopic(w io.Writer, t *Topic) {
 
 	if t.NextStep != "" {
 		fmt.Fprintf(w, "  → %s\n", t.NextStep)
+	}
+	fmt.Fprintln(w)
+}
+
+func renderMarkdownRepoLevel(w io.Writer, t *Topic) {
+	var nonSession, sessions []Activity
+	for _, a := range t.Activities {
+		if a.Kind == "session" {
+			sessions = append(sessions, a)
+		} else {
+			nonSession = append(nonSession, a)
+		}
+	}
+
+	for _, a := range nonSession {
+		timeStr := a.Time.Local().Format("15:04")
+		desc := activityDescription(a)
+		fmt.Fprintf(w, "- %s  %s\n", timeStr, desc)
+	}
+
+	if len(sessions) > 0 {
+		fmt.Fprintln(w, "\n**Claude sessions:**")
+		for _, a := range sessions {
+			timeStr := a.Time.Local().Format("15:04")
+			durStr := formatDuration(a.Duration)
+			if a.Details != "" {
+				fmt.Fprintf(w, "- %s  (%s) %s\n", timeStr, durStr, a.Details)
+			} else {
+				fmt.Fprintf(w, "- %s  (%s)\n", timeStr, durStr)
+			}
+		}
+	}
+
+	if t.NextStep != "" {
+		fmt.Fprintf(w, "\n→ %s\n", t.NextStep)
 	}
 	fmt.Fprintln(w)
 }
